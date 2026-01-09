@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+# build.py
+import os
+import json
+import platform
+import sys
+import time
+import shutil
+import subprocess
+
+# Get the directory where this script is located
+script_dir = os.path.dirname(os.path.abspath(__file__))
+# ../lib
+lib_dir = os.path.abspath(os.path.join(script_dir, "..", "lib"))
+
+python_executable = "python3"
+cmakelist_patcher_script = os.path.join(lib_dir, "__cmakelist_patcher")
+Config_File = "build.conf"
+Template_Config_File = os.path.join(lib_dir, "build.conf.template")
+Template_CMakeLists_File = os.path.join(lib_dir, "CMakeLists.txt.template")
+CMakeFile = "CMakeLists.txt"
+Build_Toolchain = "gcc-arm-none-eabi"
+
+
+def print_error(message):
+    print(f"\033[91m{message}\033[0m")
+
+
+def error(message) -> str:
+    return f"\033[91m{message}\033[0m"
+
+
+def delete_folder(folder_path):
+    if os.path.exists(folder_path) and os.path.isdir(folder_path):
+        shutil.rmtree(folder_path)
+        print(f"Deleted folder: {folder_path}")
+    else:
+        print(f"Folder not found: {folder_path}")
+
+
+# obtains name from the CMakeFile after it has been patched
+def get_target_executable_name() -> str:
+    if not os.path.exists(CMakeFile):
+        print(f"{CMakeFile} does not exist.")
+        return ""
+
+    with open(CMakeFile, "r") as file:
+        for line in file:
+            if line.strip().startswith("set(CMAKE_PROJECT_NAME "):
+                # Extract the word until the closing parenthesis
+                target_name = (
+                    line.strip().split("set(CMAKE_PROJECT_NAME ")[1].split(")")[0]
+                )
+                return target_name
+    print(f"TARGET_EXECUTABLE not found in {CMakeFile}.")
+    return ""
+
+
+def build_project():
+    # Use CMake build system
+    configure_cmd = f"cmake -S . -B build --toolchain cmake/{Build_Toolchain}.cmake"
+    build_cmd = "cmake --build build"
+
+    print("Configuring CMake project...")
+    result = os.system(configure_cmd)
+    if result != 0:
+        print("CMake configuration failed!")
+        return False
+
+    print("Building project...")
+    result = os.system(build_cmd)
+    if result != 0:
+        print("Build failed!")
+        return False
+
+    print("Build completed successfully!")
+    return True
+
+
+def clean_project():
+    # Clean CMake build directory
+    delete_folder("build")
+    print("Cleaned build directory")
+
+
+def full_clean_project():
+    # Clean everything that can be regenerated
+    delete_folder("build")
+    delete_folder("cmake")
+    if os.path.exists("CMakeLists.txt"):
+        os.remove("CMakeLists.txt")
+    if os.path.exists("CMakePresets.json"):
+        os.remove("CMakePresets.json")
+    if os.path.exists("CMakeUserPresets.json"):
+        os.remove("CMakeUserPresets.json")
+    if os.path.exists("CMakeCache.txt"):
+        os.remove("CMakeCache.txt")
+
+    for file in os.listdir("."):
+        if (
+            file.endswith(".h")
+            or file.endswith(".s")
+            or file.endswith(".c")
+            or file.endswith(".ld")
+            or file.endswith(".mxproject")
+        ):
+            print(f"Removing file: {file}")
+            os.remove(file)
+
+def generate_config_file() -> None:
+    with open(Config_File, "w") as f:
+        if os.path.exists(Template_Config_File):
+            with open(Template_Config_File, "r") as template_file:
+                f.write(template_file.read())
+            print(f"Generated {Config_File} from template.")
+        else:
+            print_error(f"Template config file not found: {Template_Config_File}")
+            print_error(f"Please reinstall cmakebuild!")
+            sys.exit(1)
+
+
+def generate_cmake_file(force: bool = False) -> bool:
+    """Generate a starting CMakeLists.txt file from template.
+    
+    Args:
+        force: If True, overwrite existing CMakeLists.txt file.
+        
+    Returns:
+        True if file was generated, False otherwise.
+    """
+    if os.path.exists(CMakeFile) and not force:
+        print(f"{CMakeFile} already exists. Use 'generate_cmake --force' to overwrite.")
+        return False
+    
+    if not os.path.exists(Template_CMakeLists_File):
+        print_error(f"Template CMakeLists.txt file not found: {Template_CMakeLists_File}")
+        print_error(f"Please reinstall cmakebuild!")
+        return False
+    
+    with open(Template_CMakeLists_File, "r") as template_file:
+        template_content = template_file.read()
+    
+    with open(CMakeFile, "w") as f:
+        f.write(template_content)
+    
+    print(f"Generated {CMakeFile} from template.")
+    print(f"You can now edit {Config_File} and run 'cmakebuild patch' to apply your configuration.")
+    return True
+
+
+def patch_cmakefile():
+    result = os.system(
+        f"{python_executable} {cmakelist_patcher_script} --cmake-file ./CMakeLists.txt"
+    )
+    print(f"Return code: {result >> 8}")  # os.system returns exit code << 8
+
+
+def un_patch_cmakefile():
+    result = os.system(
+        f"{python_executable} {cmakelist_patcher_script} --cmake-file ./CMakeLists.txt --restore"
+    )
+    print(f"Return code: {result >> 8}")
+
+
+def patch_vscode_intellisense():
+    # find or create and patch .vscode/c_cpp_properties.json by adding "compileCommands": ["${workspaceFolder}/build/compile_commands.json"]
+    path = ".vscode/c_cpp_properties.json"
+    new_path = "${workspaceFolder}/build/compile_commands.json"
+
+    if not os.path.exists(path):
+        os.makedirs(".vscode", exist_ok=True)
+        default_config = {
+            "configurations": [{"name": "Linux", "compileCommands": [new_path]}],
+            "version": 4,
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(default_config, f, indent=4)
+        print("Created .vscode/c_cpp_properties.json with compileCommands")
+        return
+
+    print("Patching .vscode/c_cpp_properties.json for Intellisense...")
+
+    with open(path, "r+", encoding="utf-8") as f:
+        try:
+            data = json.load(f)
+        except json.JSONDecodeError:
+            print("Invalid or empty JSON file, creating new configuration...")
+            data = {"configurations": [], "version": 4}
+
+        # Ensure configurations key exists
+        if "configurations" not in data:
+            data["configurations"] = []
+
+        if len(data["configurations"]) == 0:
+            data["configurations"].append(
+                {"name": "Linux", "compileCommands": [new_path]}
+            )
+            modified = True
+        else:
+            modified = False
+            for cfg in data["configurations"]:
+                if "compileCommands" not in cfg:
+                    cfg["compileCommands"] = [new_path]
+                    modified = True
+                else:
+                    if not isinstance(cfg["compileCommands"], list):
+                        cfg["compileCommands"] = [str(cfg["compileCommands"])]
+                        modified = True
+
+                    if new_path not in cfg["compileCommands"]:
+                        cfg["compileCommands"].append(new_path)
+                        modified = True
+
+        if modified:
+            f.seek(0)
+            json.dump(data, f, indent=4)
+            f.truncate()
+            print("Patched existing c_cpp_properties.json")
+        else:
+            print("c_cpp_properties.json already patched")
+
+
+# fmt: off
+
+def print_usage():
+    print("Usage: cmakebuild [command]")
+    print("Commands:")
+    print("  all                          - Patch, build and flash project (default)")
+    print("  init                         - provides an empty build.conf file for configuration")
+    print("  generate_cmake               - Generate a starting CMakeLists.txt file from template")
+    print("  generate_cmake --force       - Overwrite existing CMakeLists.txt with template")
+    print("  build                        - attempt to build project only")
+    print("  flash                        - Flash project to device")
+    print("  clean                        - Clean build folder")
+    print("  full_clean                   - Clean build folder and remove all generated files")
+    print("  debug                        - Start a debugging session")
+    print("  generate                     - Generate project files from .ioc | this is a potentially destructive operation")
+    print("  patch                        - Patch CMakeLists.txt and fix main.c")
+    print("  unpatch                      - restore CMakeLists.txt | this does not restore main.c, for that re-generate the project")
+    print("  enable_vscode_intellisense   - generate .vscode/c_cpp_properties.json for Intellisense")
+    print("Note: Patching validates itself, so multiple patchings is safe.")
+
+    print("\nOptional arguments:")
+    print(
+        "  --ioc <filepath>  - Specify the .ioc file to use (if not provided, the script will look for a single .ioc file in the current directory)"
+    )
+
+# fmt: on
+
+
+if __name__ == "__main__":
+    start_time = time.time()
+
+    # detect linux os
+    detected_os = platform.system()
+    if not detected_os == "Linux":
+        print("This script is intended to run on Linux systems.")
+        print("Detected OS:", detected_os)
+        sys.exit(1)
+
+    # Get command line argument
+    command = sys.argv[1] if len(sys.argv) > 1 else "help"
+
+    if command == "all":
+        patch_cmakefile()
+        if build_project():
+            print("Build succeeded.")
+            sys.exit(0)
+        else:
+            print("Build failed, not flashing.")
+            delete_folder("build")
+            sys.exit(1)
+    elif command == "init":
+        if os.path.exists(Config_File):
+            print(f"{Config_File} already exists.")
+        else:
+            generate_config_file()
+
+    elif command == "generate_cmake":
+        force = "--force" in sys.argv
+        if not generate_cmake_file(force):
+            sys.exit(1)
+
+    elif command == "build":
+        if build_project():
+            print("Build succeeded.")
+            sys.exit(0)
+        else:
+            print("Build failed.")
+            delete_folder("build")
+            sys.exit(1)
+
+    elif command == "clean":
+        clean_project()
+
+    elif command == "patch":
+        patch_cmakefile()
+    elif command == "unpatch":
+        un_patch_cmakefile()
+
+    elif command == "enable_vscode_intellisense":
+        patch_vscode_intellisense()
+
+    elif command == "help" or command == "--help" or command == "-h":
+        print_usage()
+        sys.exit(0)
+
+    else:
+        print(f"Unknown command: {command}")
+        print_usage()
+        sys.exit(1)
+
+    end_time = time.time()
+    print(f"Operation completed in {end_time - start_time:.2f} seconds.")
