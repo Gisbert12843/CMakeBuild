@@ -96,6 +96,8 @@ class CMakePatcher:
             "GlobalDefines": self._handle_globaldefines,
             "InsertBelowLast": self._handle_insert_below_last,
             "InsertAbovePadding": self._handle_insert_above_padding,
+            "Toolchain": self._handle_toolchain,
+            "ToolchainPath": self._handle_toolchain_path,
         }
         self.known_topics = set(self._topic_handlers.keys())
 
@@ -396,6 +398,18 @@ class CMakePatcher:
         print(f"  TASK ADDED: Set default build type to '{children[0]}'.")
         return True
 
+    def _handle_toolchain(self, children: list[str]) -> bool:
+        """Handle Toolchain topic - processed by cmakebuild, not by patcher."""
+        if children:
+            print(f"  INFO: Toolchain '{children[0]}' will be used by cmakebuild.")
+        return True
+
+    def _handle_toolchain_path(self, children: list[str]) -> bool:
+        """Handle ToolchainPath topic - processed by cmakebuild, not by patcher."""
+        if children:
+            print(f"  INFO: Toolchain path '{children[0]}' will be used by cmakebuild.")
+        return True
+
     def _handle_include_folders(self, children: list[str]) -> bool:
 
         if not children:
@@ -453,7 +467,7 @@ class CMakePatcher:
         self.tasks.append(
             Task(
                 TaskType.INSERT_BELOW_LAST,
-                "add_subdirectory(",
+                "# SUBDIRECTORY_MARKER",
                 ["target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE"]
                 + [f"    {c}" for c in children]
                 + [")"],
@@ -498,7 +512,7 @@ class CMakePatcher:
             self.tasks.append(
                 Task(
                     TaskType.INSERT_BELOW,
-                    "add_subdirectory(",
+                    "# SUBDIRECTORY_MARKER",
                     [
                         f"add_subdirectory({library_path} ${{CMAKE_BINARY_DIR}}/{os.path.basename(library_path)})"
                     ],

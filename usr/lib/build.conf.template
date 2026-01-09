@@ -1,6 +1,12 @@
 Project
     # Testname
 
+Toolchain
+    # gcc-arm-none-eabi
+
+ToolchainPath
+    # /usr/bin
+
 BuildType
     # Debug
     # Release

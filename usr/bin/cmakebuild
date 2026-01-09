@@ -19,7 +19,125 @@ Config_File = "build.conf"
 Template_Config_File = os.path.join(lib_dir, "build.conf.template")
 Template_CMakeLists_File = os.path.join(lib_dir, "CMakeLists.txt.template")
 CMakeFile = "CMakeLists.txt"
-Build_Toolchain = "gcc-arm-none-eabi"
+
+
+def parse_config_topics(file_content: str) -> dict:
+    """
+    Parses a simple indented text configuration into a dictionary.
+    Same logic as in __cmakelist_patcher.
+    """
+    import collections
+    parsed_data = collections.OrderedDict()
+    current_topic = None
+
+    for line_num, line in enumerate(file_content.splitlines(), 1):
+        stripped_line = line.strip()
+
+        if not stripped_line or stripped_line.startswith("#"):
+            continue
+
+        if not line[0].isspace():
+            current_topic = stripped_line
+            if current_topic in parsed_data:
+                raise ValueError(
+                    f"Configuration Error: Duplicate topic '{current_topic}' found on line {line_num}."
+                )
+            parsed_data[current_topic] = []
+        else:
+            if not current_topic:
+                raise ValueError(
+                    f"Configuration Error: Found an indented child '{stripped_line}' on line {line_num} before any topic was defined."
+                )
+            parsed_data[current_topic].append(stripped_line)
+
+    return dict(parsed_data)
+
+
+def get_toolchain_config() -> tuple:
+    """
+    Reads Toolchain and ToolchainPath from build.conf.
+    Returns (toolchain_name, toolchain_path) tuple.
+    toolchain_path may be None if not specified.
+    """
+    if not os.path.exists(Config_File):
+        return (None, None)
+    
+    try:
+        with open(Config_File, "r") as f:
+            config = parse_config_topics(f.read())
+    except Exception as e:
+        print_error(f"Error parsing {Config_File}: {e}")
+        return (None, None)
+    
+    toolchain = None
+    toolchain_path = None
+    
+    if "Toolchain" in config and config["Toolchain"]:
+        toolchain = config["Toolchain"][0]
+    
+    if "ToolchainPath" in config and config["ToolchainPath"]:
+        toolchain_path = config["ToolchainPath"][0]
+    
+    return (toolchain, toolchain_path)
+
+
+def find_compiler(toolchain: str, toolchain_path: str | None = None) -> tuple:
+    """
+    Finds the C and C++ compiler executables for a given toolchain.
+    
+    Args:
+        toolchain: The toolchain name (e.g., 'gcc', 'clang', 'gcc-arm-none-eabi')
+        toolchain_path: Optional path to the toolchain bin directory
+    
+    Returns:
+        Tuple of (c_compiler, cxx_compiler) absolute paths, or (None, None) if not found.
+    """
+    # Common patterns for different toolchains
+    if toolchain.startswith("gcc") or toolchain.endswith("-gcc"):
+        # For cross-compilers like gcc-arm-none-eabi, arm-none-eabi-gcc, etc.
+        if "-" in toolchain:
+            # Try both formats: toolchain-gcc and gcc-toolchain
+            prefix = toolchain.replace("-gcc", "").replace("gcc-", "")
+            c_names = [f"{prefix}-gcc", f"{toolchain}-gcc", toolchain]
+            cxx_names = [f"{prefix}-g++", f"{toolchain}-g++", toolchain.replace("gcc", "g++")]
+        else:
+            c_names = ["gcc"]
+            cxx_names = ["g++"]
+    elif toolchain.startswith("clang") or toolchain.endswith("-clang"):
+        if "-" in toolchain:
+            prefix = toolchain.replace("-clang", "").replace("clang-", "")
+            c_names = [f"{prefix}-clang", f"clang-{prefix}", toolchain]
+            cxx_names = [f"{prefix}-clang++", f"clang++-{prefix}", toolchain.replace("clang", "clang++")]
+        else:
+            c_names = ["clang"]
+            cxx_names = ["clang++"]
+    else:
+        # Generic: assume it's the C compiler name directly
+        c_names = [toolchain]
+        # Try common C++ suffixes
+        if toolchain.endswith("cc"):
+            cxx_names = [toolchain[:-2] + "++", toolchain.replace("cc", "c++")]
+        elif toolchain.endswith("gcc"):
+            cxx_names = [toolchain.replace("gcc", "g++")]
+        else:
+            cxx_names = [toolchain + "++", toolchain]
+    
+    def find_executable(names, search_path=None):
+        for name in names:
+            if search_path:
+                full_path = os.path.join(search_path, name)
+                if os.path.isfile(full_path) and os.access(full_path, os.X_OK):
+                    return full_path
+            # Also check PATH
+            result = shutil.which(name, path=search_path)
+            if result:
+                return result
+        return None
+    
+    c_compiler = find_executable(c_names, toolchain_path)
+    cxx_compiler = find_executable(cxx_names, toolchain_path)
+    
+    return (c_compiler, cxx_compiler)
 
 
 def print_error(message):
@@ -58,7 +176,37 @@ def get_target_executable_name() -> str:
 
 def build_project():
     # Use CMake build system
-    configure_cmd = f"cmake -S . -B build --toolchain cmake/{Build_Toolchain}.cmake"
+    # Read toolchain configuration from build.conf
+    toolchain, toolchain_path = get_toolchain_config()
+    
+    c_compiler = None
+    cxx_compiler = None
+    
+    if toolchain:
+        c_compiler, cxx_compiler = find_compiler(toolchain, toolchain_path)
+        if not c_compiler and not cxx_compiler:
+            print_error(f"Could not find compiler for toolchain '{toolchain}'")
+            if toolchain_path:
+                print_error(f"  Searched in: {toolchain_path}")
+            print_error("  Also searched in PATH")
+            return False
+    
+    # Build the configure command
+    configure_cmd = "cmake -S . -B build"
+    
+    if c_compiler or cxx_compiler:
+        if c_compiler:
+            configure_cmd += f" -DCMAKE_C_COMPILER={c_compiler}"
+        if cxx_compiler:
+            configure_cmd += f" -DCMAKE_CXX_COMPILER={cxx_compiler}"
+        print(f"Using toolchain:")
+        if c_compiler:
+            print(f"  C Compiler: {c_compiler}")
+        if cxx_compiler:
+            print(f"  C++ Compiler: {cxx_compiler}")
+    else:
+        print("No toolchain configured, using system default compiler.")
+    
     build_cmd = "cmake --build build"
 
     print("Configuring CMake project...")
@@ -153,6 +301,28 @@ def patch_cmakefile():
         f"{python_executable} {cmakelist_patcher_script} --cmake-file ./CMakeLists.txt"
     )
     print(f"Return code: {result >> 8}")  # os.system returns exit code << 8
+    
+    # Show toolchain configuration info
+    toolchain, toolchain_path = get_toolchain_config()
+    if toolchain:
+        print(f"\nToolchain configured: {toolchain}")
+        if toolchain_path:
+            print(f"Toolchain path: {toolchain_path}")
+        
+        c_compiler, cxx_compiler = find_compiler(toolchain, toolchain_path)
+        
+        if c_compiler or cxx_compiler:
+            print("Resolved compilers:")
+            if c_compiler:
+                print(f"  C Compiler: {c_compiler}")
+            if cxx_compiler:
+                print(f"  C++ Compiler: {cxx_compiler}")
+        else:
+            print_error(f"Warning: Could not find compiler for toolchain '{toolchain}'")
+            if toolchain_path:
+                print_error(f"  Searched in: {toolchain_path}")
+            print_error("  Also searched in PATH")
+            print_error("  Please check your Toolchain and ToolchainPath settings in build.conf")
 
 
 def un_patch_cmakefile():
@@ -235,10 +405,19 @@ def print_usage():
     print("  full_clean                   - Clean build folder and remove all generated files")
     print("  debug                        - Start a debugging session")
     print("  generate                     - Generate project files from .ioc | this is a potentially destructive operation")
-    print("  patch                        - Patch CMakeLists.txt and fix main.c")
+    print("  patch                        - Patch CMakeLists.txt and resolve toolchain from build.conf")
     print("  unpatch                      - restore CMakeLists.txt | this does not restore main.c, for that re-generate the project")
     print("  enable_vscode_intellisense   - generate .vscode/c_cpp_properties.json for Intellisense")
     print("Note: Patching validates itself, so multiple patchings is safe.")
+
+    print("\nToolchain Configuration (in build.conf):")
+    print("  Toolchain                    - Toolchain name (e.g., gcc, clang, arm-none-eabi-gcc)")
+    print("  ToolchainPath                - Optional path to toolchain bin directory")
+    print("  Example:")
+    print("    Toolchain")
+    print("        arm-none-eabi-gcc")
+    print("    ToolchainPath")
+    print("        /opt/arm-toolchain/bin")
 
     print("\nOptional arguments:")
     print(

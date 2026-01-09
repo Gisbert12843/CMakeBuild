@@ -1,5 +1,5 @@
 Package: cmakebuild
-Version: 0.0.1
+Version: 0.0.2
 Architecture: all
 Maintainer: Kai Oestreich <oestreich@incoretex.de>
 Description: A small Wrapper around scripts easing the building and flashing of CMake based Projects.
