@@ -323,6 +323,9 @@ def patch_cmakefile():
                 print_error(f"  Searched in: {toolchain_path}")
             print_error("  Also searched in PATH")
             print_error("  Please check your Toolchain and ToolchainPath settings in build.conf")
+    
+    # Update VS Code include paths if c_cpp_properties.json exists
+    update_vscode_include_paths()
 
 
 def un_patch_cmakefile():
@@ -388,6 +391,76 @@ def patch_vscode_intellisense():
             print("Patched existing c_cpp_properties.json")
         else:
             print("c_cpp_properties.json already patched")
+
+
+def update_vscode_include_paths():
+    """
+    Updates the includePath in .vscode/c_cpp_properties.json with folders from build.conf IncludeFolders.
+    Only updates if the file already exists.
+    """
+    path = ".vscode/c_cpp_properties.json"
+    
+    if not os.path.exists(path):
+        return  # Only update if file exists
+    
+    if not os.path.exists(Config_File):
+        return  # No config file to read from
+    
+    # Read include folders from build.conf
+    try:
+        with open(Config_File, "r") as f:
+            config = parse_config_topics(f.read())
+    except Exception as e:
+        print_error(f"Error parsing {Config_File}: {e}")
+        return
+    
+    include_folders = config.get("IncludeFolders", [])
+    if not include_folders:
+        return  # No include folders configured
+    
+    # Convert to VS Code format with ${workspaceFolder} prefix
+    vscode_include_paths = ["${workspaceFolder}"]
+    for folder in include_folders:
+        # Skip comments
+        if folder.startswith("#"):
+            continue
+        vscode_include_paths.append(f"${{workspaceFolder}}/{folder}")
+    
+    if len(vscode_include_paths) <= 1:
+        return  # Only the default path, no actual folders
+    
+    print("Updating .vscode/c_cpp_properties.json with include paths...")
+    
+    try:
+        with open(path, "r+", encoding="utf-8") as f:
+            try:
+                data = json.load(f)
+            except json.JSONDecodeError:
+                print_error("Invalid JSON in c_cpp_properties.json, skipping include path update")
+                return
+            
+            if "configurations" not in data or len(data["configurations"]) == 0:
+                return
+            
+            modified = False
+            for cfg in data["configurations"]:
+                current_paths = cfg.get("includePath", [])
+                
+                # Check if update is needed
+                if set(current_paths) != set(vscode_include_paths):
+                    cfg["includePath"] = vscode_include_paths
+                    modified = True
+            
+            if modified:
+                f.seek(0)
+                json.dump(data, f, indent=4)
+                f.truncate()
+                print(f"Updated includePath with: {', '.join(include_folders)}")
+            else:
+                print("includePath already up to date")
+    
+    except Exception as e:
+        print_error(f"Error updating c_cpp_properties.json: {e}")
 
 
 # fmt: off
