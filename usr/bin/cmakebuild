@@ -333,7 +333,7 @@ def generate_cmake_file(force: bool = False) -> bool:
     return True
 
 
-def patch_cmakefile():
+def patch_project():
         
 
     result = os.system(
@@ -363,8 +363,9 @@ def patch_cmakefile():
             print_error("  Also searched in PATH")
             print_error("  Please check your Toolchain and ToolchainPath settings in build.conf")
     
-        # Update VS Code include paths if c_cpp_properties.json exists
-        update_vscode_include_paths()
+    # Update VS Code settings if c_cpp_properties.json exists
+    update_vscode_include_paths()
+    update_vscode_language_standards()
 
 
 def un_patch_cmakefile():
@@ -433,6 +434,67 @@ def update_vscode_intellisense(create_file=False):
             print("Patched existing c_cpp_properties.json")
         else:
             print("c_cpp_properties.json already patched")
+
+
+def update_vscode_language_standards():
+    """
+    Updates the cStandard and cppStandard in .vscode/c_cpp_properties.json based on build.conf.
+    Only updates if the file already exists.
+    """
+    path = ".vscode/c_cpp_properties.json"
+    
+    if not os.path.exists(path):
+        return  # Only update if file exists
+    
+    cpp_version, c_version = get_language_standards()
+    
+    if not cpp_version and not c_version:
+        return  # No language standards configured
+    
+    print("Updating .vscode/c_cpp_properties.json with language standards...")
+    
+    try:
+        with open(path, "r+", encoding="utf-8") as f:
+            try:
+                data = json.load(f)
+            except json.JSONDecodeError:
+                print_error("Invalid JSON in c_cpp_properties.json, skipping language standards update")
+                return
+            
+            if "configurations" not in data or len(data["configurations"]) == 0:
+                return
+            
+            modified = False
+            for cfg in data["configurations"]:
+                if cpp_version:
+                    # Convert numeric version to c_cpp_properties format (e.g., "17" -> "c++17")
+                    cpp_std = f"c++{cpp_version}"
+                    if cfg.get("cppStandard") != cpp_std:
+                        cfg["cppStandard"] = cpp_std
+                        modified = True
+                
+                if c_version:
+                    # Convert numeric version to c_cpp_properties format (e.g., "11" -> "c11")
+                    c_std = f"c{c_version}"
+                    if cfg.get("cStandard") != c_std:
+                        cfg["cStandard"] = c_std
+                        modified = True
+            
+            if modified:
+                f.seek(0)
+                json.dump(data, f, indent=4)
+                f.truncate()
+                standards_msg = []
+                if cpp_version:
+                    standards_msg.append(f"C++{cpp_version}")
+                if c_version:
+                    standards_msg.append(f"C{c_version}")
+                print(f"Updated language standards: {', '.join(standards_msg)}")
+            else:
+                print("Language standards already up to date")
+    
+    except Exception as e:
+        print_error(f"Error updating c_cpp_properties.json: {e}")
 
 
 def update_vscode_include_paths():
@@ -533,7 +595,7 @@ def update_cmakefile():
     print("Restoring CMakeLists.txt to defaults...")
     un_patch_cmakefile()
     print("Patching CMakeLists.txt...")
-    patch_cmakefile()
+    patch_project()
 
 
 def launch_project():
@@ -603,7 +665,7 @@ if __name__ == "__main__":
         if not os.path.exists(CMakeFile):
             generate_cmake_file()
 
-        update_vscode_intellisense(create_file=True)
+        update_vscode_intellisense(create_file=False)
 
     elif command == "generate_cmake":
         force = "--force" in sys.argv
@@ -615,8 +677,7 @@ if __name__ == "__main__":
             print("Build succeeded.")
             sys.exit(0)
         else:
-            print("Build failed.")
-            delete_folder("build")
+            print("Build failed!!")
             sys.exit(1)
             
     elif command == "launch":
@@ -627,7 +688,6 @@ if __name__ == "__main__":
 
     elif command == "update":
         update_cmakefile()
-        update_vscode_include_paths()
         
     elif command == "restore":
         un_patch_cmakefile()
