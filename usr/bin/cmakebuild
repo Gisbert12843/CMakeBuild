@@ -598,7 +598,7 @@ def update_cmakefile():
     patch_project()
 
 
-def launch_project():
+def launch_project(args: list = None):
     target_name = get_target_executable_name()
     if not target_name:
         print_error("Could not determine target executable name.")
@@ -611,8 +611,13 @@ def launch_project():
         print_error("Please build the project first.")
         return
 
-    print(f"Launching {executable_path}...")
-    os.system(executable_path)
+    if args:
+        cmd = [executable_path] + args
+        print(f"Launching {executable_path} with arguments: \"{' '.join(args)}\"")
+        subprocess.run(cmd)
+    else:
+        print(f"Launching {executable_path}...")
+        os.system(executable_path)
 
 
 # fmt: off
@@ -624,7 +629,7 @@ def print_usage():
     print("  init                         - Initialize project (config, cmake, vscode)")
     print("  generate_cmake               - Generate a starting CMakeLists.txt file from template")
     print("  build                        - Attempt to build project only")
-    print("  launch                       - Run the executable located in the build folder")
+    print("  launch [args...]             - Run the executable located in the build folder with optional arguments")
     print("  clean                        - Clean build folder")
     print("  update                       - Restore CMakeLists.txt to defaults then patch it")
     print("  restore                      - Restore CMakeLists.txt to defaults")
@@ -681,7 +686,7 @@ if __name__ == "__main__":
             sys.exit(1)
             
     elif command == "launch":
-        launch_project()
+        launch_project(sys.argv[2:] if len(sys.argv) > 2 else None)
 
     elif command == "clean":
         clean_project()
