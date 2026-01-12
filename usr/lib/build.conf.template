@@ -30,6 +30,15 @@ Languages
     CXX
     ASM
 
+CppVersion
+    # 17
+    # 23
+
+CVersion
+    # 99
+    # 17
+    # 23
+
 GlobalDefines
     # TESTMAKRO 1
     # TESTMAKRO=2

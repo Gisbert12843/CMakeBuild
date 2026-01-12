@@ -81,6 +81,34 @@ def get_toolchain_config() -> tuple:
     return (toolchain, toolchain_path)
 
 
+def get_language_standards() -> tuple:
+    """
+    Reads CppVersion and CVersion from build.conf.
+    Returns (cpp_version, c_version) tuple.
+    Values may be None if not specified.
+    """
+    if not os.path.exists(Config_File):
+        return (None, None)
+    
+    try:
+        with open(Config_File, "r") as f:
+            config = parse_config_topics(f.read())
+    except Exception as e:
+        print_error(f"Error parsing {Config_File}: {e}")
+        return (None, None)
+    
+    cpp_version = None
+    c_version = None
+    
+    if "CppVersion" in config and config["CppVersion"]:
+        cpp_version = config["CppVersion"][0]
+    
+    if "CVersion" in config and config["CVersion"]:
+        c_version = config["CVersion"][0]
+    
+    return (cpp_version, c_version)
+
+
 def find_compiler(toolchain: str, toolchain_path: str | None = None) -> tuple:
     """
     Finds the C and C++ compiler executables for a given toolchain.
@@ -178,6 +206,7 @@ def build_project():
     # Use CMake build system
     # Read toolchain configuration from build.conf
     toolchain, toolchain_path = get_toolchain_config()
+    cpp_version, c_version = get_language_standards()
     
     c_compiler = None
     cxx_compiler = None
@@ -192,7 +221,7 @@ def build_project():
             return False
     
     # Build the configure command
-    configure_cmd = "cmake -S . -B build"
+    configure_cmd = "cmake -S . -B build --fresh"
     
     if c_compiler or cxx_compiler:
         if c_compiler:
@@ -206,6 +235,14 @@ def build_project():
             print(f"  C++ Compiler: {cxx_compiler}")
     else:
         print("No toolchain configured, using system default compiler.")
+    
+    # Add language standard flags
+    if cpp_version:
+        configure_cmd += f" -DCMAKE_CXX_STANDARD={cpp_version}"
+        print(f"C++ Standard: C++{cpp_version}")
+    if c_version:
+        configure_cmd += f" -DCMAKE_C_STANDARD={c_version}"
+        print(f"C Standard: C{c_version}")
     
     build_cmd = "cmake --build build"
 
@@ -292,11 +329,13 @@ def generate_cmake_file(force: bool = False) -> bool:
         f.write(template_content)
     
     print(f"Generated {CMakeFile} from template.")
-    print(f"You can now edit {Config_File} and run 'cmakebuild patch' to apply your configuration.")
+    print(f"You can now edit {Config_File} and run 'cmakebuild update' to apply your configuration.")
     return True
 
 
 def patch_cmakefile():
+        
+
     result = os.system(
         f"{python_executable} {cmakelist_patcher_script} --cmake-file ./CMakeLists.txt"
     )
@@ -324,8 +363,8 @@ def patch_cmakefile():
             print_error("  Also searched in PATH")
             print_error("  Please check your Toolchain and ToolchainPath settings in build.conf")
     
-    # Update VS Code include paths if c_cpp_properties.json exists
-    update_vscode_include_paths()
+        # Update VS Code include paths if c_cpp_properties.json exists
+        update_vscode_include_paths()
 
 
 def un_patch_cmakefile():
@@ -335,23 +374,26 @@ def un_patch_cmakefile():
     print(f"Return code: {result >> 8}")
 
 
-def patch_vscode_intellisense():
+def update_vscode_intellisense(create_file=False):
     # find or create and patch .vscode/c_cpp_properties.json by adding "compileCommands": ["${workspaceFolder}/build/compile_commands.json"]
     path = ".vscode/c_cpp_properties.json"
     new_path = "${workspaceFolder}/build/compile_commands.json"
 
     if not os.path.exists(path):
-        os.makedirs(".vscode", exist_ok=True)
-        default_config = {
-            "configurations": [{"name": "Linux", "compileCommands": [new_path]}],
-            "version": 4,
-        }
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(default_config, f, indent=4)
-        print("Created .vscode/c_cpp_properties.json with compileCommands")
-        return
+        if create_file:
+            os.makedirs(".vscode", exist_ok=True)
+            default_config = {
+                "configurations": [{"name": "Linux", "compileCommands": [new_path]}],
+                "version": 4,
+            }
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(default_config, f, indent=4)
+            print("Created .vscode/c_cpp_properties.json with compileCommands")
+            return
+        else:
+            return  # File doesn't exist and we shouldn't create it
 
-    print("Patching .vscode/c_cpp_properties.json for Intellisense...")
+    print("Updating .vscode/c_cpp_properties.json for Intellisense...")
 
     with open(path, "r+", encoding="utf-8") as f:
         try:
@@ -395,18 +437,21 @@ def patch_vscode_intellisense():
 
 def update_vscode_include_paths():
     """
-    Updates the includePath in .vscode/c_cpp_properties.json with folders from build.conf IncludeFolders.
+    Updates the includePath in .vscode/c_cpp_properties.json with folders from build.conf.
+    Includes both IncludeFolders and library paths from Libraries.
     Only updates if the file already exists.
     """
     path = ".vscode/c_cpp_properties.json"
     
     if not os.path.exists(path):
+        print("No .vscode/c_cpp_properties.json found, skipping include path update.")
         return  # Only update if file exists
     
     if not os.path.exists(Config_File):
+        print(f"No {Config_File} found, skipping include path update.")
         return  # No config file to read from
     
-    # Read include folders from build.conf
+    # Read config from build.conf
     try:
         with open(Config_File, "r") as f:
             config = parse_config_topics(f.read())
@@ -414,19 +459,40 @@ def update_vscode_include_paths():
         print_error(f"Error parsing {Config_File}: {e}")
         return
     
-    include_folders = config.get("IncludeFolders", [])
-    if not include_folders:
-        return  # No include folders configured
-    
-    # Convert to VS Code format with ${workspaceFolder} prefix
+    # Start with workspace folder
     vscode_include_paths = ["${workspaceFolder}"]
+    
+    # Add include folders
+    include_folders = config.get("IncludeFolders", [])
     for folder in include_folders:
-        # Skip comments
         if folder.startswith("#"):
             continue
         vscode_include_paths.append(f"${{workspaceFolder}}/{folder}")
     
+    # Add library paths (Libraries format: "libName path/to/lib")
+    libraries = config.get("Libraries", [])
+    for lib_entry in libraries:
+        if lib_entry.startswith("#"):
+            continue
+        parts = lib_entry.split(" ", 1)
+        if len(parts) == 2:
+            lib_path = parts[1]
+            # Add the library path itself
+            if lib_path.startswith("/"):
+                # Absolute path
+                vscode_include_paths.append(lib_path)
+            else:
+                # Relative path
+                vscode_include_paths.append(f"${{workspaceFolder}}/{lib_path}")
+            # Also add common include subdirectories if they might exist
+            for subdir in ["include", "inc", "src", "Include", "Inc", "Src"]:
+                if lib_path.startswith("/"):
+                    vscode_include_paths.append(f"{lib_path}/{subdir}")
+                else:
+                    vscode_include_paths.append(f"${{workspaceFolder}}/{lib_path}/{subdir}")
+    
     if len(vscode_include_paths) <= 1:
+        print("No include paths configured in build.conf.")
         return  # Only the default path, no actual folders
     
     print("Updating .vscode/c_cpp_properties.json with include paths...")
@@ -463,39 +529,44 @@ def update_vscode_include_paths():
         print_error(f"Error updating c_cpp_properties.json: {e}")
 
 
+def update_cmakefile():
+    print("Restoring CMakeLists.txt to defaults...")
+    un_patch_cmakefile()
+    print("Patching CMakeLists.txt...")
+    patch_cmakefile()
+
+
+def launch_project():
+    target_name = get_target_executable_name()
+    if not target_name:
+        print_error("Could not determine target executable name.")
+        return
+
+    executable_path = os.path.join("build", target_name)
+    
+    if not os.path.exists(executable_path):
+        print_error(f"Executable not found at {executable_path}")
+        print_error("Please build the project first.")
+        return
+
+    print(f"Launching {executable_path}...")
+    os.system(executable_path)
+
+
 # fmt: off
 
 def print_usage():
     print("Usage: cmakebuild [command]")
     print("Commands:")
-    print("  all                          - Patch, build and flash project (default)")
-    print("  init                         - provides an empty build.conf file for configuration")
+    print("  all                          - Update, build and flash project (default)")
+    print("  init                         - Initialize project (config, cmake, vscode)")
     print("  generate_cmake               - Generate a starting CMakeLists.txt file from template")
-    print("  generate_cmake --force       - Overwrite existing CMakeLists.txt with template")
-    print("  build                        - attempt to build project only")
-    print("  flash                        - Flash project to device")
+    print("  build                        - Attempt to build project only")
+    print("  launch                       - Run the executable located in the build folder")
     print("  clean                        - Clean build folder")
-    print("  full_clean                   - Clean build folder and remove all generated files")
-    print("  debug                        - Start a debugging session")
-    print("  generate                     - Generate project files from .ioc | this is a potentially destructive operation")
-    print("  patch                        - Patch CMakeLists.txt and resolve toolchain from build.conf")
-    print("  unpatch                      - restore CMakeLists.txt | this does not restore main.c, for that re-generate the project")
-    print("  enable_vscode_intellisense   - generate .vscode/c_cpp_properties.json for Intellisense")
-    print("Note: Patching validates itself, so multiple patchings is safe.")
-
-    print("\nToolchain Configuration (in build.conf):")
-    print("  Toolchain                    - Toolchain name (e.g., gcc, clang, arm-none-eabi-gcc)")
-    print("  ToolchainPath                - Optional path to toolchain bin directory")
-    print("  Example:")
-    print("    Toolchain")
-    print("        arm-none-eabi-gcc")
-    print("    ToolchainPath")
-    print("        /opt/arm-toolchain/bin")
-
-    print("\nOptional arguments:")
-    print(
-        "  --ioc <filepath>  - Specify the .ioc file to use (if not provided, the script will look for a single .ioc file in the current directory)"
-    )
+    print("  update                       - Restore CMakeLists.txt to defaults then patch it")
+    print("  restore                      - Restore CMakeLists.txt to defaults")
+    print("  enable_vscode_intellisense   - Generate .vscode/c_cpp_properties.json for Intellisense")
 
 # fmt: on
 
@@ -514,9 +585,10 @@ if __name__ == "__main__":
     command = sys.argv[1] if len(sys.argv) > 1 else "help"
 
     if command == "all":
-        patch_cmakefile()
+        update_cmakefile()
         if build_project():
-            print("Build succeeded.")
+            print("Build succeeded.\nStarting Executible.")
+            launch_project()
             sys.exit(0)
         else:
             print("Build failed, not flashing.")
@@ -527,6 +599,11 @@ if __name__ == "__main__":
             print(f"{Config_File} already exists.")
         else:
             generate_config_file()
+        
+        if not os.path.exists(CMakeFile):
+            generate_cmake_file()
+
+        update_vscode_intellisense(create_file=True)
 
     elif command == "generate_cmake":
         force = "--force" in sys.argv
@@ -541,17 +618,22 @@ if __name__ == "__main__":
             print("Build failed.")
             delete_folder("build")
             sys.exit(1)
+            
+    elif command == "launch":
+        launch_project()
 
     elif command == "clean":
         clean_project()
 
-    elif command == "patch":
-        patch_cmakefile()
-    elif command == "unpatch":
+    elif command == "update":
+        update_cmakefile()
+        update_vscode_include_paths()
+        
+    elif command == "restore":
         un_patch_cmakefile()
 
     elif command == "enable_vscode_intellisense":
-        patch_vscode_intellisense()
+        update_vscode_intellisense(True)
 
     elif command == "help" or command == "--help" or command == "-h":
         print_usage()

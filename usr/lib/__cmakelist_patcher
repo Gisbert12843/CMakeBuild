@@ -98,6 +98,8 @@ class CMakePatcher:
             "InsertAbovePadding": self._handle_insert_above_padding,
             "Toolchain": self._handle_toolchain,
             "ToolchainPath": self._handle_toolchain_path,
+            "CppVersion": self._handle_cpp_version,
+            "CVersion": self._handle_c_version,
         }
         self.known_topics = set(self._topic_handlers.keys())
 
@@ -410,6 +412,40 @@ class CMakePatcher:
             print(f"  INFO: Toolchain path '{children[0]}' will be used by cmakebuild.")
         return True
 
+    def _handle_cpp_version(self, children: list[str]) -> bool:
+        """Handle CppVersion topic - patches CMAKE_CXX_STANDARD in CMakeLists.txt."""
+        if not children:
+            print("Ignoring empty 'CppVersion' topic.")
+            return False
+        
+        version = children[0]
+        self.tasks.append(
+            Task(
+                TaskType.REPLACE,
+                "set(CMAKE_CXX_STANDARD",
+                [f"set(CMAKE_CXX_STANDARD {version})"],
+            )
+        )
+        print(f"  TASK ADDED: Set C++ standard to {version}.")
+        return True
+
+    def _handle_c_version(self, children: list[str]) -> bool:
+        """Handle CVersion topic - patches CMAKE_C_STANDARD in CMakeLists.txt."""
+        if not children:
+            print("Ignoring empty 'CVersion' topic.")
+            return False
+        
+        version = children[0]
+        self.tasks.append(
+            Task(
+                TaskType.REPLACE,
+                "set(CMAKE_C_STANDARD",
+                [f"set(CMAKE_C_STANDARD {version})"],
+            )
+        )
+        print(f"  TASK ADDED: Set C standard to {version}.")
+        return True
+
     def _handle_include_folders(self, children: list[str]) -> bool:
 
         if not children:
@@ -535,18 +571,6 @@ class CMakePatcher:
                 [f'enable_language({" ".join(children)})'],
             )
         )
-        if children.__contains__("CXX"):
-            self.tasks.append(
-                Task(
-                    TaskType.INSERT_BELOW,
-                    "set(CMAKE_C_EXTENSIONS",
-                    [
-                        "set(CMAKE_CXX_STANDARD 17)",
-                        "set(CMAKE_CXX_STANDARD_REQUIRED ON)",
-                        "set(CMAKE_CXX_EXTENSIONS ON)",
-                    ],
-                )
-            )
 
         print(f"  TASK ADDED: Enable languages: {', '.join(children)}")
         return True
