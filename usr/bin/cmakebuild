@@ -61,24 +61,61 @@ def get_toolchain_config() -> tuple:
     """
     if not os.path.exists(Config_File):
         return (None, None)
-    
+
     try:
         with open(Config_File, "r") as f:
             config = parse_config_topics(f.read())
     except Exception as e:
         print_error(f"Error parsing {Config_File}: {e}")
         return (None, None)
-    
+
     toolchain = None
     toolchain_path = None
-    
+
     if "Toolchain" in config and config["Toolchain"]:
         toolchain = config["Toolchain"][0]
-    
+
     if "ToolchainPath" in config and config["ToolchainPath"]:
         toolchain_path = config["ToolchainPath"][0]
-    
+
     return (toolchain, toolchain_path)
+
+
+def get_toolchain_file() -> str | None:
+    """
+    Reads ToolchainFile from build.conf and returns it as an absolute path.
+
+    Falls back to the CMAKE_TOOLCHAIN_FILE environment variable when the
+    topic is absent, so an existing exported setup keeps working.
+    Returns None if neither is set.
+    """
+    toolchain_file = None
+
+    if os.path.exists(Config_File):
+        try:
+            with open(Config_File, "r") as f:
+                config = parse_config_topics(f.read())
+        except Exception as e:
+            print_error(f"Error parsing {Config_File}: {e}")
+            config = {}
+
+        if config.get("ToolchainFile"):
+            toolchain_file = config["ToolchainFile"][0]
+
+    if not toolchain_file:
+        toolchain_file = os.environ.get("CMAKE_TOOLCHAIN_FILE")
+
+    if not toolchain_file:
+        return None
+
+    # Relative entries in build.conf are relative to the project directory.
+    toolchain_file = os.path.abspath(os.path.expanduser(toolchain_file))
+
+    if not os.path.isfile(toolchain_file):
+        print_error(f"Toolchain file not found: {toolchain_file}")
+        return None
+
+    return toolchain_file
 
 
 def get_language_standards() -> tuple:
@@ -89,34 +126,34 @@ def get_language_standards() -> tuple:
     """
     if not os.path.exists(Config_File):
         return (None, None)
-    
+
     try:
         with open(Config_File, "r") as f:
             config = parse_config_topics(f.read())
     except Exception as e:
         print_error(f"Error parsing {Config_File}: {e}")
         return (None, None)
-    
+
     cpp_version = None
     c_version = None
-    
+
     if "CppVersion" in config and config["CppVersion"]:
         cpp_version = config["CppVersion"][0]
-    
+
     if "CVersion" in config and config["CVersion"]:
         c_version = config["CVersion"][0]
-    
+
     return (cpp_version, c_version)
 
 
 def find_compiler(toolchain: str, toolchain_path: str | None = None) -> tuple:
     """
     Finds the C and C++ compiler executables for a given toolchain.
-    
+
     Args:
         toolchain: The toolchain name (e.g., 'gcc', 'clang', 'gcc-arm-none-eabi')
         toolchain_path: Optional path to the toolchain bin directory
-    
+
     Returns:
         Tuple of (c_compiler, cxx_compiler) absolute paths, or (None, None) if not found.
     """
@@ -149,7 +186,7 @@ def find_compiler(toolchain: str, toolchain_path: str | None = None) -> tuple:
             cxx_names = [toolchain.replace("gcc", "g++")]
         else:
             cxx_names = [toolchain + "++", toolchain]
-    
+
     def find_executable(names, search_path=None):
         for name in names:
             if search_path:
@@ -161,10 +198,10 @@ def find_compiler(toolchain: str, toolchain_path: str | None = None) -> tuple:
             if result:
                 return result
         return None
-    
+
     c_compiler = find_executable(c_names, toolchain_path)
     cxx_compiler = find_executable(cxx_names, toolchain_path)
-    
+
     return (c_compiler, cxx_compiler)
 
 
@@ -206,11 +243,12 @@ def build_project():
     # Use CMake build system
     # Read toolchain configuration from build.conf
     toolchain, toolchain_path = get_toolchain_config()
+    toolchain_file = get_toolchain_file()
     cpp_version, c_version = get_language_standards()
-    
+
     c_compiler = None
     cxx_compiler = None
-    
+
     if toolchain:
         c_compiler, cxx_compiler = find_compiler(toolchain, toolchain_path)
         if not c_compiler and not cxx_compiler:
@@ -219,10 +257,16 @@ def build_project():
                 print_error(f"  Searched in: {toolchain_path}")
             print_error("  Also searched in PATH")
             return False
-    
+
     # Build the configure command
     configure_cmd = "cmake -S . -B build --fresh"
-    
+
+    # A cross/bare-metal build needs its CMake toolchain file on every
+    # configure: --fresh wipes the cache, so nothing is remembered.
+    if toolchain_file:
+        configure_cmd += f" -DCMAKE_TOOLCHAIN_FILE={toolchain_file}"
+        print(f"Toolchain file: {toolchain_file}")
+
     if c_compiler or cxx_compiler:
         if c_compiler:
             configure_cmd += f" -DCMAKE_C_COMPILER={c_compiler}"
@@ -235,7 +279,7 @@ def build_project():
             print(f"  C++ Compiler: {cxx_compiler}")
     else:
         print("No toolchain configured, using system default compiler.")
-    
+
     # Add language standard flags
     if cpp_version:
         configure_cmd += f" -DCMAKE_CXX_STANDARD={cpp_version}"
@@ -243,7 +287,7 @@ def build_project():
     if c_version:
         configure_cmd += f" -DCMAKE_C_STANDARD={c_version}"
         print(f"C Standard: C{c_version}")
-    
+
     build_cmd = "cmake --build build"
 
     print("Configuring CMake project...")
@@ -306,50 +350,50 @@ def generate_config_file() -> None:
 
 def generate_cmake_file(force: bool = False) -> bool:
     """Generate a starting CMakeLists.txt file from template.
-    
+
     Args:
         force: If True, overwrite existing CMakeLists.txt file.
-        
+
     Returns:
         True if file was generated, False otherwise.
     """
     if os.path.exists(CMakeFile) and not force:
         print(f"{CMakeFile} already exists. Use 'generate_cmake --force' to overwrite.")
         return False
-    
+
     if not os.path.exists(Template_CMakeLists_File):
         print_error(f"Template CMakeLists.txt file not found: {Template_CMakeLists_File}")
         print_error(f"Please reinstall cmakebuild!")
         return False
-    
+
     with open(Template_CMakeLists_File, "r") as template_file:
         template_content = template_file.read()
-    
+
     with open(CMakeFile, "w") as f:
         f.write(template_content)
-    
+
     print(f"Generated {CMakeFile} from template.")
     print(f"You can now edit {Config_File} and run 'cmakebuild update' to apply your configuration.")
     return True
 
 
 def patch_project():
-        
+
 
     result = os.system(
         f"{python_executable} {cmakelist_patcher_script} --cmake-file ./CMakeLists.txt"
     )
     print(f"Return code: {result >> 8}")  # os.system returns exit code << 8
-    
+
     # Show toolchain configuration info
     toolchain, toolchain_path = get_toolchain_config()
     if toolchain:
         print(f"\nToolchain configured: {toolchain}")
         if toolchain_path:
             print(f"Toolchain path: {toolchain_path}")
-        
+
         c_compiler, cxx_compiler = find_compiler(toolchain, toolchain_path)
-        
+
         if c_compiler or cxx_compiler:
             print("Resolved compilers:")
             if c_compiler:
@@ -362,7 +406,7 @@ def patch_project():
                 print_error(f"  Searched in: {toolchain_path}")
             print_error("  Also searched in PATH")
             print_error("  Please check your Toolchain and ToolchainPath settings in build.conf")
-    
+
     # Update VS Code settings if c_cpp_properties.json exists
     update_vscode_include_paths()
     update_vscode_language_standards()
@@ -442,17 +486,17 @@ def update_vscode_language_standards():
     Only updates if the file already exists.
     """
     path = ".vscode/c_cpp_properties.json"
-    
+
     if not os.path.exists(path):
         return  # Only update if file exists
-    
+
     cpp_version, c_version = get_language_standards()
-    
+
     if not cpp_version and not c_version:
         return  # No language standards configured
-    
+
     print("Updating .vscode/c_cpp_properties.json with language standards...")
-    
+
     try:
         with open(path, "r+", encoding="utf-8") as f:
             try:
@@ -460,10 +504,10 @@ def update_vscode_language_standards():
             except json.JSONDecodeError:
                 print_error("Invalid JSON in c_cpp_properties.json, skipping language standards update")
                 return
-            
+
             if "configurations" not in data or len(data["configurations"]) == 0:
                 return
-            
+
             modified = False
             for cfg in data["configurations"]:
                 if cpp_version:
@@ -472,14 +516,14 @@ def update_vscode_language_standards():
                     if cfg.get("cppStandard") != cpp_std:
                         cfg["cppStandard"] = cpp_std
                         modified = True
-                
+
                 if c_version:
                     # Convert numeric version to c_cpp_properties format (e.g., "11" -> "c11")
                     c_std = f"c{c_version}"
                     if cfg.get("cStandard") != c_std:
                         cfg["cStandard"] = c_std
                         modified = True
-            
+
             if modified:
                 f.seek(0)
                 json.dump(data, f, indent=4)
@@ -492,7 +536,7 @@ def update_vscode_language_standards():
                 print(f"Updated language standards: {', '.join(standards_msg)}")
             else:
                 print("Language standards already up to date")
-    
+
     except Exception as e:
         print_error(f"Error updating c_cpp_properties.json: {e}")
 
@@ -504,15 +548,15 @@ def update_vscode_include_paths():
     Only updates if the file already exists.
     """
     path = ".vscode/c_cpp_properties.json"
-    
+
     if not os.path.exists(path):
         print("No .vscode/c_cpp_properties.json found, skipping include path update.")
         return  # Only update if file exists
-    
+
     if not os.path.exists(Config_File):
         print(f"No {Config_File} found, skipping include path update.")
         return  # No config file to read from
-    
+
     # Read config from build.conf
     try:
         with open(Config_File, "r") as f:
@@ -520,17 +564,17 @@ def update_vscode_include_paths():
     except Exception as e:
         print_error(f"Error parsing {Config_File}: {e}")
         return
-    
+
     # Start with workspace folder
     vscode_include_paths = ["${workspaceFolder}"]
-    
+
     # Add include folders
     include_folders = config.get("IncludeFolders", [])
     for folder in include_folders:
         if folder.startswith("#"):
             continue
         vscode_include_paths.append(f"${{workspaceFolder}}/{folder}")
-    
+
     # Add library paths (Libraries format: "libName path/to/lib")
     libraries = config.get("Libraries", [])
     for lib_entry in libraries:
@@ -552,13 +596,13 @@ def update_vscode_include_paths():
                     vscode_include_paths.append(f"{lib_path}/{subdir}")
                 else:
                     vscode_include_paths.append(f"${{workspaceFolder}}/{lib_path}/{subdir}")
-    
+
     if len(vscode_include_paths) <= 1:
         print("No include paths configured in build.conf.")
         return  # Only the default path, no actual folders
-    
+
     print("Updating .vscode/c_cpp_properties.json with include paths...")
-    
+
     try:
         with open(path, "r+", encoding="utf-8") as f:
             try:
@@ -566,19 +610,19 @@ def update_vscode_include_paths():
             except json.JSONDecodeError:
                 print_error("Invalid JSON in c_cpp_properties.json, skipping include path update")
                 return
-            
+
             if "configurations" not in data or len(data["configurations"]) == 0:
                 return
-            
+
             modified = False
             for cfg in data["configurations"]:
                 current_paths = cfg.get("includePath", [])
-                
+
                 # Check if update is needed
                 if set(current_paths) != set(vscode_include_paths):
                     cfg["includePath"] = vscode_include_paths
                     modified = True
-            
+
             if modified:
                 f.seek(0)
                 json.dump(data, f, indent=4)
@@ -586,7 +630,7 @@ def update_vscode_include_paths():
                 print(f"Updated includePath with: {', '.join(include_folders)}")
             else:
                 print("includePath already up to date")
-    
+
     except Exception as e:
         print_error(f"Error updating c_cpp_properties.json: {e}")
 
@@ -605,7 +649,7 @@ def launch_project(args: list = None):
         return
 
     executable_path = os.path.join("build", target_name)
-    
+
     if not os.path.exists(executable_path):
         print_error(f"Executable not found at {executable_path}")
         print_error("Please build the project first.")
@@ -666,7 +710,7 @@ if __name__ == "__main__":
             print(f"{Config_File} already exists.")
         else:
             generate_config_file()
-        
+
         if not os.path.exists(CMakeFile):
             generate_cmake_file()
 
@@ -684,7 +728,7 @@ if __name__ == "__main__":
         else:
             print("Build failed!!")
             sys.exit(1)
-            
+
     elif command == "launch":
         launch_project(sys.argv[2:] if len(sys.argv) > 2 else None)
 
@@ -693,7 +737,7 @@ if __name__ == "__main__":
 
     elif command == "update":
         update_cmakefile()
-        
+
     elif command == "restore":
         un_patch_cmakefile()
 

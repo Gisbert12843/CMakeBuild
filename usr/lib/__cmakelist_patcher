@@ -98,6 +98,7 @@ class CMakePatcher:
             "InsertAbovePadding": self._handle_insert_above_padding,
             "Toolchain": self._handle_toolchain,
             "ToolchainPath": self._handle_toolchain_path,
+            "ToolchainFile": self._handle_toolchain_file,
             "CppVersion": self._handle_cpp_version,
             "CVersion": self._handle_c_version,
         }
@@ -412,12 +413,18 @@ class CMakePatcher:
             print(f"  INFO: Toolchain path '{children[0]}' will be used by cmakebuild.")
         return True
 
+    def _handle_toolchain_file(self, children: list[str]) -> bool:
+        """Handle ToolchainFile topic - processed by cmakebuild, not by patcher."""
+        if children:
+            print(f"  INFO: Toolchain file '{children[0]}' will be used by cmakebuild.")
+        return True
+
     def _handle_cpp_version(self, children: list[str]) -> bool:
         """Handle CppVersion topic - patches CMAKE_CXX_STANDARD in CMakeLists.txt."""
         if not children:
             print("Ignoring empty 'CppVersion' topic.")
             return False
-        
+
         version = children[0]
         self.tasks.append(
             Task(
@@ -434,7 +441,7 @@ class CMakePatcher:
         if not children:
             print("Ignoring empty 'CVersion' topic.")
             return False
-        
+
         version = children[0]
         self.tasks.append(
             Task(
