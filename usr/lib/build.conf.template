@@ -42,3 +42,8 @@ CVersion
 GlobalDefines
     # TESTMAKRO 1
     # TESTMAKRO=2
+
+CustomSets
+    # CMAKE_SYSTEM_NAME Generic
+    # CMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY
+    # CMAKE_EXE_LINKER_FLAGS_INIT "--specs=nosys.specs"

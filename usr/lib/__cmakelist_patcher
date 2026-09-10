@@ -94,6 +94,7 @@ class CMakePatcher:
             "Libraries": self._handle_libraries,
             "Languages": self._handle_languages,
             "GlobalDefines": self._handle_globaldefines,
+            "CustomSets": self._handle_custom_sets,
             "InsertBelowLast": self._handle_insert_below_last,
             "InsertAbovePadding": self._handle_insert_above_padding,
             "Toolchain": self._handle_toolchain,
@@ -617,6 +618,54 @@ class CMakePatcher:
             )
         )
         print(f"  TASK ADDED: Add global defines: {', '.join(defines)}")
+        return True
+
+    def _handle_custom_sets(self, children: list[str]) -> bool:
+        """
+        Handle CustomSets topic - emits plain set() commands right above the
+        project() call, so they are in effect for the whole project.
+
+        Accepted child formats:
+            VARIABLE value
+            VARIABLE=value
+            VARIABLE "value with spaces"
+        """
+        if not children:
+            print("Ignoring empty 'CustomSets' topic.")
+            return False
+
+        set_commands = []
+
+        for child in children:
+            # Only split on '=' when it appears before the first space,
+            # so 'MY_VAR a=b' keeps 'a=b' as the value.
+            first_word = child.split(" ", 1)[0]
+            if "=" in first_word:
+                variable, value = child.split("=", 1)
+            else:
+                parts = child.split(" ", 1)
+                variable, value = parts[0], parts[1] if len(parts) == 2 else ""
+
+            variable = variable.strip()
+            value = value.strip()
+
+            if not variable or not value:
+                raise ValueError(
+                    f"Custom set definition '{child}' must be in format "
+                    f"'VARIABLE value' or 'VARIABLE=value'."
+                )
+
+            set_commands.append(f"set({variable} {value})")
+
+        content = ["# Custom set commands"] + set_commands + [""]
+        self.tasks.append(
+            Task(
+                TaskType.INSERT_ABOVE,
+                "project(${CMAKE_PROJECT_NAME})",
+                content,
+            )
+        )
+        print(f"  TASK ADDED: Add custom set commands: {', '.join(set_commands)}")
         return True
         ############################################################################
         ############################################################################
