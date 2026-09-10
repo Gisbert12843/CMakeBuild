@@ -238,10 +238,11 @@ class CMakePatcher:
             if task.task_type == TaskType.INSERT_BELOW_LAST and not task.completed:
                 # Find the last occurrence of this target in the original lines
                 last_match_line_num = -1
+                target_is_comment = task.target_line_start.strip().startswith("#")
                 for i, line in enumerate(lines):
-                    if not line.strip().startswith("#") and line.strip().startswith(
-                        task.target_line_start
-                    ):
+                    if (
+                        target_is_comment or not line.strip().startswith("#")
+                    ) and line.strip().startswith(task.target_line_start):
                         last_match_line_num = i
 
                 if last_match_line_num != -1:
@@ -258,6 +259,13 @@ class CMakePatcher:
             # Always add comments as-is
             if line.strip().startswith("#"):
                 modified_lines.append(line)
+                # ...but a comment line can still be an INSERT_BELOW_LAST anchor
+                if line_idx in below_last_targets:
+                    for task in below_last_targets[line_idx]:
+                        modified_lines.extend(
+                            [l + "\n" for l in task.new_line_content]
+                        )
+                        task.completed = True
                 line_idx += 1
                 continue
 
