@@ -6,6 +6,149 @@ import sys
 import argparse
 from dataclasses import dataclass, field
 from enum import Enum, auto
+import types
+
+### Terminal styling
+# These helpers are shared with the `cmakebuild` front-end, which imports this
+# file by path. They live here rather than in a module of their own so the
+# package stays at exactly two installable scripts.
+#
+# Colors are disabled automatically when stdout is not a TTY, when NO_COLOR is
+# set, or for TERM=dumb, so piped/redirected output stays clean. Override with
+# CMAKEBUILD_COLOR=always|never|auto.
+
+_mode = os.environ.get("CMAKEBUILD_COLOR", "auto").lower()
+
+if _mode == "always":
+    COLOR = True
+elif _mode == "never":
+    COLOR = False
+else:
+    COLOR = (
+        sys.stdout.isatty()
+        and os.environ.get("NO_COLOR") is None
+        and os.environ.get("TERM", "") != "dumb"
+    )
+
+# Child processes inherit the decision, so a redirected `cmakebuild` run does
+# not end up with a colored patcher writing into the same pipe.
+os.environ["CMAKEBUILD_COLOR"] = "always" if COLOR else "never"
+
+# The patcher runs as a child process, so our own output must not sit in a
+# block buffer while the child writes straight to the same stream.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except (AttributeError, ValueError):  # pragma: no cover - very old/odd streams
+    pass
+
+_CODES = {
+    "reset": "\033[0m",
+    "bold": "\033[1m",
+    "dim": "\033[2m",
+    "red": "\033[91m",
+    "green": "\033[92m",
+    "yellow": "\033[93m",
+    "blue": "\033[94m",
+    "magenta": "\033[95m",
+    "cyan": "\033[96m",
+    "grey": "\033[90m",
+}
+
+_UNICODE = "utf" in (sys.stdout.encoding or "").lower()
+
+_SYM_OK = "✔" if _UNICODE else "+"
+_SYM_FAIL = "✘" if _UNICODE else "x"
+_SYM_WARN = "⚠" if _UNICODE else "!"
+_SYM_INFO = "ℹ" if _UNICODE else "i"
+_SYM_STEP = "▶" if _UNICODE else ">"
+_SYM_TASK = "•" if _UNICODE else "-"
+_RULE = "─" if _UNICODE else "-"
+
+
+def paint(text: str, *styles: str) -> str:
+    """Wraps text in the given styles (no-op when colors are disabled)."""
+    if not COLOR or not styles:
+        return text
+    prefix = "".join(_CODES[s] for s in styles if s in _CODES)
+    return f"{prefix}{text}{_CODES['reset']}" if prefix else text
+
+
+def header(text: str) -> None:
+    """A section heading with a rule under it."""
+    print()
+    print(paint(text, "bold", "cyan"))
+    print(paint(_RULE * max(len(text), 8), "dim", "cyan"))
+
+
+def step(text: str) -> None:
+    """An action that is about to happen."""
+    print(f"{paint(_SYM_STEP, 'blue')} {paint(text, 'bold')}")
+
+
+def ok(text: str) -> None:
+    print(f"{paint(_SYM_OK, 'green')} {text}")
+
+
+def fail(text: str) -> None:
+    print(f"{paint(_SYM_FAIL, 'red')} {paint(text, 'red', 'bold')}", file=sys.stderr)
+
+
+def warn(text: str) -> None:
+    print(f"{paint(_SYM_WARN, 'yellow')} {paint(text, 'yellow')}")
+
+
+def info(text: str) -> None:
+    print(f"  {paint(_SYM_INFO, 'cyan')} {text}")
+
+
+def task(text: str) -> None:
+    """A queued patch task / bullet item."""
+    print(f"  {paint(_SYM_TASK, 'magenta')} {text}")
+
+
+def detail(text: str) -> None:
+    """Secondary, de-emphasised output."""
+    print(f"  {paint(text, 'dim')}")
+
+
+def kv(key: str, value: str, indent: int = 2) -> None:
+    """A key: value pair with the value highlighted."""
+    print(f"{' ' * indent}{paint(key + ':', 'dim')} {paint(str(value), 'cyan')}")
+
+
+def skipped(text: str) -> None:
+    """Something intentionally not done."""
+    print(f"{paint(_SYM_TASK, 'grey')} {paint(text, 'grey')}")
+
+
+def banner_success(text: str) -> None:
+    print()
+    print(paint(f" {_SYM_OK} {text} ", "bold", "green"))
+
+
+def banner_failure(text: str) -> None:
+    print()
+    print(paint(f" {_SYM_FAIL} {text} ", "bold", "red"), file=sys.stderr)
+
+
+# Bundled as a namespace so both this script and cmakebuild can say `term.ok(...)`.
+term = types.SimpleNamespace(
+    COLOR=COLOR,
+    paint=paint,
+    header=header,
+    step=step,
+    ok=ok,
+    fail=fail,
+    warn=warn,
+    info=info,
+    task=task,
+    detail=detail,
+    kv=kv,
+    skipped=skipped,
+    banner_success=banner_success,
+    banner_failure=banner_failure,
+)
+###
 
 ### Configuration
 config_file = "build.conf"
@@ -110,7 +253,7 @@ class CMakePatcher:
         Stores the original CMakeLists.txt content as a commented backup.
         """
         if self._has_backup():
-            print("Backup already exists, skipping backup creation.")
+            term.skipped("Backup already exists, keeping the original one.")
             return
 
         try:
@@ -130,10 +273,10 @@ class CMakePatcher:
             with open(self.cmake_filepath, "a") as file:
                 file.write(backup_section)
 
-            print("Original CMakeLists.txt content backed up in commented section.")
+            term.ok("Original content backed up in a commented section.")
 
         except FileNotFoundError:
-            print(f"Error: {self.cmake_filepath} not found!")
+            term.fail(f"{self.cmake_filepath} not found!")
 
     def _has_backup(self):
         """
@@ -150,7 +293,7 @@ class CMakePatcher:
         Restores the original CMakeLists.txt content from the backup section.
         """
         if not self._has_backup():
-            print("No backup found in CMakeLists.txt. Cannot restore.")
+            term.warn("No backup found in CMakeLists.txt - nothing to restore.")
             return False
 
         try:
@@ -186,11 +329,11 @@ class CMakePatcher:
             with open(self.cmake_filepath, "w") as file:
                 file.write(restored_content)
 
-            print(f"Successfully restored {self.cmake_filepath} from backup.")
+            term.ok(f"Restored {self.cmake_filepath} from backup.")
             return True
 
         except (FileNotFoundError, IOError) as e:
-            print(f"Error during restoration: {e}")
+            term.fail(f"Error during restoration: {e}")
             return False
 
     def _validate_config(self):
@@ -202,7 +345,7 @@ class CMakePatcher:
                 raise ValueError(
                     f"Configuration Error: Unknown topic '{topic}' found in config file."
                 )
-        print("Configuration validated successfully.")
+        term.ok("Configuration validated.")
 
     def run(self):
         """
@@ -210,17 +353,37 @@ class CMakePatcher:
         """
         with open(self.config_filepath, "r") as f:
             self.config = parse_config_topics(f.read())
-        print(self.config)
 
+        self._print_config()
+
+        term.header("Validating")
         self._validate_config()
-
         self._store_original_backup()
 
+        term.header("Planning patches")
         for topic, children in self.config.items():
             handler = self._topic_handlers[topic]
             handler(children)
 
-        self._apply_patches_from_tasks()
+        term.header("Applying patches")
+        return self._apply_patches_from_tasks()
+
+    def _print_config(self):
+        """Prints the parsed build.conf as a readable, aligned table."""
+        term.header(f"Configuration ({self.config_filepath})")
+        if not self.config:
+            term.warn("Configuration is empty.")
+            return
+        width = max(len(topic) for topic in self.config)
+        for topic, children in self.config.items():
+            known = topic in self.known_topics
+            label = term.paint(topic.ljust(width), "bold" if known else "red")
+            if not children:
+                print(f"  {label}  {term.paint('(empty)', 'grey')}")
+                continue
+            print(f"  {label}  {term.paint(children[0], 'cyan')}")
+            for child in children[1:]:
+                print(f"  {' ' * width}  {term.paint(child, 'cyan')}")
 
     def _apply_patches_from_tasks(self):
         """
@@ -230,8 +393,8 @@ class CMakePatcher:
             with open(self.cmake_filepath, "r") as f:
                 lines = f.readlines()
         except FileNotFoundError:
-            print(f"Error: {self.cmake_filepath} not found for patching!")
-            return
+            term.fail(f"{self.cmake_filepath} not found for patching!")
+            return False
 
         # First pass: collect all INSERT_BELOW_LAST tasks and find their target positions
         below_last_targets = {}
@@ -260,7 +423,19 @@ class CMakePatcher:
             # Always add comments as-is
             if line.strip().startswith("#"):
                 modified_lines.append(line)
-                # ...but a comment line can still be an INSERT_BELOW_LAST anchor
+                # ...but a comment line can still anchor INSERT_BELOW tasks
+                # (e.g. add_subdirectory below "# SUBDIRECTORY_MARKER")...
+                for task in self.tasks:
+                    if (
+                        not task.completed
+                        and task.task_type == TaskType.INSERT_BELOW
+                        and line.strip().startswith(task.target_line_start)
+                    ):
+                        modified_lines.extend(
+                            [l + "\n" for l in task.new_line_content]
+                        )
+                        task.completed = True
+                # ...and INSERT_BELOW_LAST ones.
                 if line_idx in below_last_targets:
                     for task in below_last_targets[line_idx]:
                         modified_lines.extend(
@@ -361,26 +536,36 @@ class CMakePatcher:
 
             line_idx += 1
 
-        uncompleted_tasks = [task for task in self.tasks if not task.completed]
+        uncompleted_tasks = [t for t in self.tasks if not t.completed]
         if uncompleted_tasks:
-            print(
-                "\nWarning: The following tasks could not be completed (target line not found):"
+            term.warn(
+                f"{len(uncompleted_tasks)} task(s) could not be applied "
+                "(target line not found):"
             )
-            for task in uncompleted_tasks:
-                print(f"  - Target: '{task.target_line_start}' ({task.task_type.name})")
+            for t in uncompleted_tasks:
+                term.detail(f"{t.target_line_start}  ({t.task_type.name})")
+
+        applied = len(self.tasks) - len(uncompleted_tasks)
 
         try:
             with open(self.cmake_filepath, "w") as f:
                 f.writelines(modified_lines)
-            print("\nFile patching complete.")
         except IOError as e:
-            print(f"Error writing to {self.cmake_filepath}: {e}")
+            term.fail(f"Error writing to {self.cmake_filepath}: {e}")
+            return False
+
+        if uncompleted_tasks:
+            term.warn(f"Applied {applied}/{len(self.tasks)} patches.")
+            return False
+
+        term.ok(f"Applied {applied}/{len(self.tasks)} patches.")
+        return True
 
     # --- Task Creation Methods ---
 
     def _handle_project(self, children: list[str]) -> bool:
         if not children:
-            print("Ignoring empty 'Project' topic.")
+            term.skipped("Ignoring empty 'Project' topic.")
             return False
         if len(children) != 1:
             raise ValueError("Topic 'Project' must have exactly one child.")
@@ -391,12 +576,12 @@ class CMakePatcher:
                 [f"set(CMAKE_PROJECT_NAME {children[0]})"],
             )
         )
-        print(f"  TASK ADDED: Set project name to '{children[0]}'.")
+        term.task(f"Set project name to '{children[0]}'.")
         return True
 
     def _handle_build_type(self, children: list[str]) -> bool:
         if not children:
-            print("Ignoring empty 'BuildType' topic.")
+            term.skipped("Ignoring empty 'BuildType' topic.")
             return False
         if len(children) != 1:
             raise ValueError("Topic 'BuildType' must have exactly one child.")
@@ -407,31 +592,31 @@ class CMakePatcher:
                 [f'set(CMAKE_BUILD_TYPE "{children[0]}")'],
             )
         )
-        print(f"  TASK ADDED: Set default build type to '{children[0]}'.")
+        term.task(f"Set default build type to '{children[0]}'.")
         return True
 
     def _handle_toolchain(self, children: list[str]) -> bool:
         """Handle Toolchain topic - processed by cmakebuild, not by patcher."""
         if children:
-            print(f"  INFO: Toolchain '{children[0]}' will be used by cmakebuild.")
+            term.info(f"Toolchain '{children[0]}' will be used by cmakebuild.")
         return True
 
     def _handle_toolchain_path(self, children: list[str]) -> bool:
         """Handle ToolchainPath topic - processed by cmakebuild, not by patcher."""
         if children:
-            print(f"  INFO: Toolchain path '{children[0]}' will be used by cmakebuild.")
+            term.info(f"Toolchain path '{children[0]}' will be used by cmakebuild.")
         return True
 
     def _handle_toolchain_file(self, children: list[str]) -> bool:
         """Handle ToolchainFile topic - processed by cmakebuild, not by patcher."""
         if children:
-            print(f"  INFO: Toolchain file '{children[0]}' will be used by cmakebuild.")
+            term.info(f"Toolchain file '{children[0]}' will be used by cmakebuild.")
         return True
 
     def _handle_cpp_version(self, children: list[str]) -> bool:
         """Handle CppVersion topic - patches CMAKE_CXX_STANDARD in CMakeLists.txt."""
         if not children:
-            print("Ignoring empty 'CppVersion' topic.")
+            term.skipped("Ignoring empty 'CppVersion' topic.")
             return False
 
         version = children[0]
@@ -442,13 +627,13 @@ class CMakePatcher:
                 [f"set(CMAKE_CXX_STANDARD {version})"],
             )
         )
-        print(f"  TASK ADDED: Set C++ standard to {version}.")
+        term.task(f"Set C++ standard to {version}.")
         return True
 
     def _handle_c_version(self, children: list[str]) -> bool:
         """Handle CVersion topic - patches CMAKE_C_STANDARD in CMakeLists.txt."""
         if not children:
-            print("Ignoring empty 'CVersion' topic.")
+            term.skipped("Ignoring empty 'CVersion' topic.")
             return False
 
         version = children[0]
@@ -459,13 +644,13 @@ class CMakePatcher:
                 [f"set(CMAKE_C_STANDARD {version})"],
             )
         )
-        print(f"  TASK ADDED: Set C standard to {version}.")
+        term.task(f"Set C standard to {version}.")
         return True
 
     def _handle_include_folders(self, children: list[str]) -> bool:
 
         if not children:
-            print("Ignoring empty 'IncludeFolders' topic.")
+            term.skipped("Ignoring empty 'IncludeFolders' topic.")
             return False
         # Replace the entire target_include_directories call
         content = ["target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE"]
@@ -478,12 +663,12 @@ class CMakePatcher:
                 content,
             )
         )
-        print(f"  TASK ADDED: Add include folders: {', '.join(children)}")
+        term.task(f"Add include folders: {', '.join(children)}")
         return True
 
     def _handle_source_folders(self, children: list[str]) -> bool:
         if not children:
-            print("Ignoring empty 'SourceFolders' topic.")
+            term.skipped("Ignoring empty 'SourceFolders' topic.")
             return False
         # Create the GLOB section
         self.tasks.append(
@@ -509,12 +694,12 @@ class CMakePatcher:
                 ],
             )
         )
-        print(f"  TASK ADDED: Add source folders.")
+        term.task(f"Add source folders.")
         return True
 
     def _handle_compile_options(self, children: list[str]) -> bool:
         if not children:
-            print("Ignoring empty 'CompileOptions' topic.")
+            term.skipped("Ignoring empty 'CompileOptions' topic.")
             return False
         self.tasks.append(
             Task(
@@ -525,13 +710,13 @@ class CMakePatcher:
                 + [")"],
             )
         )
-        print(f"  TASK ADDED: Add compile options.")
+        term.task(f"Add compile options.")
         return True
 
     def _handle_libraries(self, children: list[str]) -> bool:
 
         if not children:
-            print("Ignoring empty 'Libraries' topic.")
+            term.skipped("Ignoring empty 'Libraries' topic.")
             return False
         library_names = []
         library_paths = []
@@ -571,13 +756,13 @@ class CMakePatcher:
                 )
             )
 
-        print(f"  TASK ADDED: Link libraries: {', '.join(library_names)}")
-        print(f"  TASK ADDED: Add subdirectories: {', '.join(library_paths)}")
+        term.task(f"Link libraries: {', '.join(library_names)}")
+        term.task(f"Add subdirectories: {', '.join(library_paths)}")
         return True
 
     def _handle_languages(self, children: list[str]) -> bool:
         if not children:
-            print("Ignoring empty 'Languages' topic.")
+            term.skipped("Ignoring empty 'Languages' topic.")
             return False
 
         self.tasks.append(
@@ -588,12 +773,12 @@ class CMakePatcher:
             )
         )
 
-        print(f"  TASK ADDED: Enable languages: {', '.join(children)}")
+        term.task(f"Enable languages: {', '.join(children)}")
         return True
 
     def _handle_globaldefines(self, children: list[str]) -> bool:
         if not children:
-            print("Ignoring empty 'GlobalDefines' topic.")
+            term.skipped("Ignoring empty 'GlobalDefines' topic.")
             return False
 
         defines = []
@@ -617,7 +802,7 @@ class CMakePatcher:
                 content,
             )
         )
-        print(f"  TASK ADDED: Add global defines: {', '.join(defines)}")
+        term.task(f"Add global defines: {', '.join(defines)}")
         return True
 
     def _handle_custom_sets(self, children: list[str]) -> bool:
@@ -631,7 +816,7 @@ class CMakePatcher:
             VARIABLE "value with spaces"
         """
         if not children:
-            print("Ignoring empty 'CustomSets' topic.")
+            term.skipped("Ignoring empty 'CustomSets' topic.")
             return False
 
         set_commands = []
@@ -665,7 +850,7 @@ class CMakePatcher:
                 content,
             )
         )
-        print(f"  TASK ADDED: Add custom set commands: {', '.join(set_commands)}")
+        term.task(f"Add custom set commands: {', '.join(set_commands)}")
         return True
         ############################################################################
         ############################################################################
@@ -679,7 +864,7 @@ class CMakePatcher:
         target = children[0]
         content = children[1:]
         self.tasks.append(Task(TaskType.INSERT_BELOW, target, content))
-        print(f"  TASK ADDED: Insert {len(content)} lines below '{target}'.")
+        term.task(f"Insert {len(content)} lines below '{target}'.")
 
         ############################################################################
         ############################################################################
@@ -693,9 +878,7 @@ class CMakePatcher:
         target = children[0]
         content = children[1:]
         self.tasks.append(Task(TaskType.INSERT_BELOW_LAST, target, content))
-        print(
-            f"  TASK ADDED: Insert {len(content)} lines below last occurrence of '{target}'."
-        )
+        term.task(f"Insert {len(content)} lines below last occurrence of '{target}'.")
 
     def _handle_insert_above_padding(self, children: list[str]):
 
@@ -714,8 +897,7 @@ class CMakePatcher:
         task = Task(TaskType.INSERT_ABOVE_PADDING, target, content)
         task.padding = padding
         self.tasks.append(task)
-        print(
-            f"  TASK ADDED: Insert {len(content)} lines above '{target}' with {padding} lines padding."
+        term.task(f"Insert {len(content)} lines above '{target}' with {padding} lines padding."
         )
         ############################################################################
         ############################################################################
@@ -743,7 +925,7 @@ def add_cmake_patched_marker(cmake_file):
             with open(cmake_file, "w") as file:
                 file.writelines(lines)
     except FileNotFoundError:
-        print(f"Error: {cmake_file} not found!")
+        term.fail(f"{cmake_file} not found!")
 
 
 def main():
@@ -776,56 +958,56 @@ def main():
 
         if args.restore:
             if not os.path.exists(cmake_file_path):
-                print(f"Error: CMakeLists.txt file '{cmake_file_path}' not found!")
+                term.fail(f"CMakeLists.txt file '{cmake_file_path}' not found!")
                 return 1
 
+            term.header("Restoring CMakeLists.txt")
             patcher = CMakePatcher(cmake_file_path, config_file_path)
             return 0 if patcher.restore_from_backup() else 1
 
         if args.check_backup:
             if not os.path.exists(cmake_file_path):
-                print(f"Error: CMakeLists.txt file '{cmake_file_path}' not found!")
+                term.fail(f"CMakeLists.txt file '{cmake_file_path}' not found!")
                 return 1
 
             patcher = CMakePatcher(cmake_file_path, config_file_path)
-            print(
-                "Backup exists in CMakeLists.txt"
-                if patcher._has_backup()
-                else "No backup found in CMakeLists.txt"
-            )
+            if patcher._has_backup():
+                term.ok("Backup exists in CMakeLists.txt")
+            else:
+                term.warn("No backup found in CMakeLists.txt")
             return 0
 
         if not os.path.exists(cmake_file_path) or not os.path.exists(config_file_path):
-            print(
-                f"Error: Required files '{cmake_file_path}' or '{config_file_path}' are missing!"
+            term.fail(
+                f"Required files '{cmake_file_path}' or '{config_file_path}' are missing!"
             )
             return 1
 
         try:
             if check_cmake_patched(cmake_file_path):
-                print(f"{cmake_file_path} is already patched. Exiting.")
+                term.warn(f"{cmake_file_path} is already patched - nothing to do.")
                 return 0
 
             patcher = CMakePatcher(cmake_file_path, config_file_path)
-            patcher.run()
+            patched_cleanly = patcher.run()
             add_cmake_patched_marker(cmake_file_path)
-            print("\nPatching process completed successfully.")
-            return 0
+            return 0 if patched_cleanly else 2
 
         except ValueError as e:
-            print(f"\nError: {e}", file=sys.stderr)
+            term.fail(str(e))
             patcher = CMakePatcher(cmake_file_path, config_file_path)
             if patcher._has_backup():
-                print("Restoring from backup...", file=sys.stderr)
+                term.step("Restoring from backup...")
                 patcher.restore_from_backup()
             else:
-                print("No backup available to restore.", file=sys.stderr)
+                term.warn("No backup available to restore.")
             return 1
         except Exception as e:
-            print(f"\nAn unexpected error occurred: {e}", file=sys.stderr)
+            term.fail(f"An unexpected error occurred: {e}")
             return 1
     except Exception as e:
-        print(f"An unexpected error occurred in main: {e}", file=sys.stderr)
+        term.fail(f"An unexpected error occurred in main: {e}")
+        return 1
 
 
 if __name__ == "__main__":

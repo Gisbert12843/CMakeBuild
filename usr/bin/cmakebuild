@@ -15,6 +15,32 @@ lib_dir = os.path.abspath(os.path.join(script_dir, "..", "lib"))
 
 python_executable = "python3"
 cmakelist_patcher_script = os.path.join(lib_dir, "__cmakelist_patcher")
+
+
+def _load_terminal_styling(path: str):
+    """Borrows the terminal styling helpers from the patcher script.
+
+    The patcher has no .py extension, so it is loaded by path rather than
+    imported by name.
+    """
+    import importlib.machinery
+    import importlib.util
+
+    # spec_from_file_location() needs an explicit loader here: the patcher has
+    # no .py suffix, so the extension-based lookup finds nothing.
+    loader = importlib.machinery.SourceFileLoader("__cmakelist_patcher", path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module.term
+
+
+try:
+    term = _load_terminal_styling(cmakelist_patcher_script)
+except Exception as exc:  # pragma: no cover - broken install
+    print(f"Error: cannot load {cmakelist_patcher_script}: {exc}", file=sys.stderr)
+    print("Please reinstall cmakebuild!", file=sys.stderr)
+    sys.exit(1)
 Config_File = "build.conf"
 Template_Config_File = os.path.join(lib_dir, "build.conf.template")
 Template_CMakeLists_File = os.path.join(lib_dir, "CMakeLists.txt.template")
@@ -206,25 +232,25 @@ def find_compiler(toolchain: str, toolchain_path: str | None = None) -> tuple:
 
 
 def print_error(message):
-    print(f"\033[91m{message}\033[0m")
+    term.fail(message)
 
 
 def error(message) -> str:
-    return f"\033[91m{message}\033[0m"
+    return term.paint(message, "red")
 
 
 def delete_folder(folder_path):
     if os.path.exists(folder_path) and os.path.isdir(folder_path):
         shutil.rmtree(folder_path)
-        print(f"Deleted folder: {folder_path}")
+        term.ok(f"Deleted folder: {folder_path}")
     else:
-        print(f"Folder not found: {folder_path}")
+        term.skipped(f"Folder not found: {folder_path}")
 
 
 # obtains name from the CMakeFile after it has been patched
 def get_target_executable_name() -> str:
     if not os.path.exists(CMakeFile):
-        print(f"{CMakeFile} does not exist.")
+        term.fail(f"{CMakeFile} does not exist.")
         return ""
 
     with open(CMakeFile, "r") as file:
@@ -235,7 +261,7 @@ def get_target_executable_name() -> str:
                     line.strip().split("set(CMAKE_PROJECT_NAME ")[1].split(")")[0]
                 )
                 return target_name
-    print(f"TARGET_EXECUTABLE not found in {CMakeFile}.")
+    term.fail(f"TARGET_EXECUTABLE not found in {CMakeFile}.")
     return ""
 
 
@@ -252,10 +278,10 @@ def build_project():
     if toolchain:
         c_compiler, cxx_compiler = find_compiler(toolchain, toolchain_path)
         if not c_compiler and not cxx_compiler:
-            print_error(f"Could not find compiler for toolchain '{toolchain}'")
+            term.fail(f"Could not find a compiler for toolchain '{toolchain}'")
             if toolchain_path:
-                print_error(f"  Searched in: {toolchain_path}")
-            print_error("  Also searched in PATH")
+                term.detail(f"Searched in: {toolchain_path}")
+            term.detail("Also searched in PATH")
             return False
 
     # Build the configure command
@@ -263,53 +289,53 @@ def build_project():
 
     # A cross/bare-metal build needs its CMake toolchain file on every
     # configure: --fresh wipes the cache, so nothing is remembered.
+    term.header("Build settings")
+
     if toolchain_file:
         configure_cmd += f" -DCMAKE_TOOLCHAIN_FILE={toolchain_file}"
-        print(f"Toolchain file: {toolchain_file}")
+        term.kv("Toolchain file", toolchain_file)
 
     if c_compiler or cxx_compiler:
         if c_compiler:
             configure_cmd += f" -DCMAKE_C_COMPILER={c_compiler}"
+            term.kv("C compiler", c_compiler)
         if cxx_compiler:
             configure_cmd += f" -DCMAKE_CXX_COMPILER={cxx_compiler}"
-        print(f"Using toolchain:")
-        if c_compiler:
-            print(f"  C Compiler: {c_compiler}")
-        if cxx_compiler:
-            print(f"  C++ Compiler: {cxx_compiler}")
+            term.kv("C++ compiler", cxx_compiler)
     else:
-        print("No toolchain configured, using system default compiler.")
+        term.warn("No toolchain configured, using system default compiler.")
 
     # Add language standard flags
     if cpp_version:
         configure_cmd += f" -DCMAKE_CXX_STANDARD={cpp_version}"
-        print(f"C++ Standard: C++{cpp_version}")
+        term.kv("C++ standard", f"C++{cpp_version}")
     if c_version:
         configure_cmd += f" -DCMAKE_C_STANDARD={c_version}"
-        print(f"C Standard: C{c_version}")
+        term.kv("C standard", f"C{c_version}")
 
     build_cmd = "cmake --build build"
 
-    print("Configuring CMake project...")
-    result = os.system(configure_cmd)
-    if result != 0:
-        print("CMake configuration failed!")
+    term.header("Configuring")
+    term.detail(configure_cmd)
+    if os.system(configure_cmd) != 0:
+        term.fail("CMake configuration failed!")
+        return False
+    term.ok("Configured.")
+
+    term.header("Compiling")
+    term.step(build_cmd)
+    if os.system(build_cmd) != 0:
+        term.fail("Build failed!")
         return False
 
-    print("Building project...")
-    result = os.system(build_cmd)
-    if result != 0:
-        print("Build failed!")
-        return False
-
-    print("Build completed successfully!")
+    term.ok("Build completed successfully.")
     return True
 
 
 def clean_project():
     # Clean CMake build directory
+    term.header("Cleaning")
     delete_folder("build")
-    print("Cleaned build directory")
 
 
 def full_clean_project():
@@ -333,7 +359,7 @@ def full_clean_project():
             or file.endswith(".ld")
             or file.endswith(".mxproject")
         ):
-            print(f"Removing file: {file}")
+            term.detail(f"Removing file: {file}")
             os.remove(file)
 
 def generate_config_file() -> None:
@@ -341,10 +367,10 @@ def generate_config_file() -> None:
         if os.path.exists(Template_Config_File):
             with open(Template_Config_File, "r") as template_file:
                 f.write(template_file.read())
-            print(f"Generated {Config_File} from template.")
+            term.ok(f"Generated {Config_File} from template.")
         else:
-            print_error(f"Template config file not found: {Template_Config_File}")
-            print_error(f"Please reinstall cmakebuild!")
+            term.fail(f"Template config file not found: {Template_Config_File}")
+            term.fail("Please reinstall cmakebuild!")
             sys.exit(1)
 
 
@@ -358,12 +384,12 @@ def generate_cmake_file(force: bool = False) -> bool:
         True if file was generated, False otherwise.
     """
     if os.path.exists(CMakeFile) and not force:
-        print(f"{CMakeFile} already exists. Use 'generate_cmake --force' to overwrite.")
+        term.warn(f"{CMakeFile} already exists. Use 'generate_cmake --force' to overwrite.")
         return False
 
     if not os.path.exists(Template_CMakeLists_File):
-        print_error(f"Template CMakeLists.txt file not found: {Template_CMakeLists_File}")
-        print_error(f"Please reinstall cmakebuild!")
+        term.fail(f"Template CMakeLists.txt file not found: {Template_CMakeLists_File}")
+        term.fail("Please reinstall cmakebuild!")
         return False
 
     with open(Template_CMakeLists_File, "r") as template_file:
@@ -372,51 +398,65 @@ def generate_cmake_file(force: bool = False) -> bool:
     with open(CMakeFile, "w") as f:
         f.write(template_content)
 
-    print(f"Generated {CMakeFile} from template.")
-    print(f"You can now edit {Config_File} and run 'cmakebuild update' to apply your configuration.")
+    term.ok(f"Generated {CMakeFile} from template.")
+    term.info(f"Edit {Config_File}, then run 'cmakebuild update' to apply your configuration.")
     return True
 
 
-def patch_project():
+def patch_project() -> bool:
+    """Runs the patcher and reports the toolchain it resolved.
 
-
-    result = os.system(
+    Returns True when CMakeLists.txt was patched without errors.
+    """
+    exit_code = os.system(
         f"{python_executable} {cmakelist_patcher_script} --cmake-file ./CMakeLists.txt"
-    )
-    print(f"Return code: {result >> 8}")  # os.system returns exit code << 8
+    ) >> 8  # os.system returns the exit code shifted left by 8
+
+    ok = exit_code == 0
+    if exit_code == 2:
+        term.warn("Patcher finished with warnings (some patches were not applied).")
+    elif exit_code != 0:
+        term.fail(f"Patcher failed with exit code {exit_code}.")
 
     # Show toolchain configuration info
     toolchain, toolchain_path = get_toolchain_config()
     if toolchain:
-        print(f"\nToolchain configured: {toolchain}")
+        term.header("Toolchain")
+        term.kv("Toolchain", toolchain)
         if toolchain_path:
-            print(f"Toolchain path: {toolchain_path}")
+            term.kv("Search path", toolchain_path)
 
         c_compiler, cxx_compiler = find_compiler(toolchain, toolchain_path)
 
         if c_compiler or cxx_compiler:
-            print("Resolved compilers:")
             if c_compiler:
-                print(f"  C Compiler: {c_compiler}")
+                term.kv("C compiler", c_compiler)
             if cxx_compiler:
-                print(f"  C++ Compiler: {cxx_compiler}")
+                term.kv("C++ compiler", cxx_compiler)
+            term.ok("Compilers resolved.")
         else:
-            print_error(f"Warning: Could not find compiler for toolchain '{toolchain}'")
+            ok = False
+            term.fail(f"Could not find a compiler for toolchain '{toolchain}'")
             if toolchain_path:
-                print_error(f"  Searched in: {toolchain_path}")
-            print_error("  Also searched in PATH")
-            print_error("  Please check your Toolchain and ToolchainPath settings in build.conf")
+                term.detail(f"Searched in: {toolchain_path}")
+            term.detail("Also searched in PATH")
+            term.detail("Check the Toolchain / ToolchainPath settings in build.conf")
 
     # Update VS Code settings if c_cpp_properties.json exists
+    term.header("VS Code IntelliSense")
     update_vscode_include_paths()
     update_vscode_language_standards()
 
+    return ok
 
-def un_patch_cmakefile():
-    result = os.system(
+
+def un_patch_cmakefile() -> bool:
+    exit_code = os.system(
         f"{python_executable} {cmakelist_patcher_script} --cmake-file ./CMakeLists.txt --restore"
-    )
-    print(f"Return code: {result >> 8}")
+    ) >> 8
+    if exit_code != 0:
+        term.warn(f"Restore finished with exit code {exit_code}.")
+    return exit_code == 0
 
 
 def update_vscode_intellisense(create_file=False):
@@ -433,18 +473,18 @@ def update_vscode_intellisense(create_file=False):
             }
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(default_config, f, indent=4)
-            print("Created .vscode/c_cpp_properties.json with compileCommands")
+            term.ok("Created .vscode/c_cpp_properties.json with compileCommands")
             return
         else:
             return  # File doesn't exist and we shouldn't create it
 
-    print("Updating .vscode/c_cpp_properties.json for Intellisense...")
+    term.step("Updating .vscode/c_cpp_properties.json for IntelliSense...")
 
     with open(path, "r+", encoding="utf-8") as f:
         try:
             data = json.load(f)
         except json.JSONDecodeError:
-            print("Invalid or empty JSON file, creating new configuration...")
+            term.warn("Invalid or empty JSON file, creating new configuration...")
             data = {"configurations": [], "version": 4}
 
         # Ensure configurations key exists
@@ -475,9 +515,9 @@ def update_vscode_intellisense(create_file=False):
             f.seek(0)
             json.dump(data, f, indent=4)
             f.truncate()
-            print("Patched existing c_cpp_properties.json")
+            term.ok("Patched existing c_cpp_properties.json")
         else:
-            print("c_cpp_properties.json already patched")
+            term.skipped("c_cpp_properties.json already patched")
 
 
 def update_vscode_language_standards():
@@ -495,14 +535,14 @@ def update_vscode_language_standards():
     if not cpp_version and not c_version:
         return  # No language standards configured
 
-    print("Updating .vscode/c_cpp_properties.json with language standards...")
+    term.step("Updating language standards...")
 
     try:
         with open(path, "r+", encoding="utf-8") as f:
             try:
                 data = json.load(f)
             except json.JSONDecodeError:
-                print_error("Invalid JSON in c_cpp_properties.json, skipping language standards update")
+                term.fail("Invalid JSON in c_cpp_properties.json, skipping language standards update")
                 return
 
             if "configurations" not in data or len(data["configurations"]) == 0:
@@ -533,12 +573,12 @@ def update_vscode_language_standards():
                     standards_msg.append(f"C++{cpp_version}")
                 if c_version:
                     standards_msg.append(f"C{c_version}")
-                print(f"Updated language standards: {', '.join(standards_msg)}")
+                term.ok(f"Updated language standards: {', '.join(standards_msg)}")
             else:
-                print("Language standards already up to date")
+                term.skipped("Language standards already up to date")
 
     except Exception as e:
-        print_error(f"Error updating c_cpp_properties.json: {e}")
+        term.fail(f"Error updating c_cpp_properties.json: {e}")
 
 
 def update_vscode_include_paths():
@@ -550,11 +590,11 @@ def update_vscode_include_paths():
     path = ".vscode/c_cpp_properties.json"
 
     if not os.path.exists(path):
-        print("No .vscode/c_cpp_properties.json found, skipping include path update.")
+        term.skipped("No .vscode/c_cpp_properties.json found, skipping include path update.")
         return  # Only update if file exists
 
     if not os.path.exists(Config_File):
-        print(f"No {Config_File} found, skipping include path update.")
+        term.skipped(f"No {Config_File} found, skipping include path update.")
         return  # No config file to read from
 
     # Read config from build.conf
@@ -598,17 +638,17 @@ def update_vscode_include_paths():
                     vscode_include_paths.append(f"${{workspaceFolder}}/{lib_path}/{subdir}")
 
     if len(vscode_include_paths) <= 1:
-        print("No include paths configured in build.conf.")
+        term.skipped("No include paths configured in build.conf.")
         return  # Only the default path, no actual folders
 
-    print("Updating .vscode/c_cpp_properties.json with include paths...")
+    term.step("Updating include paths...")
 
     try:
         with open(path, "r+", encoding="utf-8") as f:
             try:
                 data = json.load(f)
             except json.JSONDecodeError:
-                print_error("Invalid JSON in c_cpp_properties.json, skipping include path update")
+                term.fail("Invalid JSON in c_cpp_properties.json, skipping include path update")
                 return
 
             if "configurations" not in data or len(data["configurations"]) == 0:
@@ -627,59 +667,79 @@ def update_vscode_include_paths():
                 f.seek(0)
                 json.dump(data, f, indent=4)
                 f.truncate()
-                print(f"Updated includePath with: {', '.join(include_folders)}")
+                term.ok(f"Updated includePath with: {', '.join(include_folders)}")
             else:
-                print("includePath already up to date")
+                term.skipped("includePath already up to date")
 
     except Exception as e:
-        print_error(f"Error updating c_cpp_properties.json: {e}")
+        term.fail(f"Error updating c_cpp_properties.json: {e}")
 
 
-def update_cmakefile():
-    print("Restoring CMakeLists.txt to defaults...")
+def update_cmakefile() -> bool:
     un_patch_cmakefile()
-    print("Patching CMakeLists.txt...")
-    patch_project()
+    return patch_project()
 
 
-def launch_project(args: list = None):
+def launch_project(args: list = None) -> bool:
     target_name = get_target_executable_name()
     if not target_name:
-        print_error("Could not determine target executable name.")
-        return
+        term.fail("Could not determine target executable name.")
+        return False
 
     executable_path = os.path.join("build", target_name)
 
     if not os.path.exists(executable_path):
-        print_error(f"Executable not found at {executable_path}")
-        print_error("Please build the project first.")
-        return
+        term.fail(f"Executable not found at {executable_path}")
+        term.detail("Please build the project first.")
+        return False
 
     if args:
         cmd = [executable_path] + args
-        print(f"Launching {executable_path} with arguments: \"{' '.join(args)}\"")
+        term.step(f"Launching {executable_path} with arguments: \"{' '.join(args)}\"")
         subprocess.run(cmd)
     else:
-        print(f"Launching {executable_path}...")
+        term.step(f"Launching {executable_path}...")
         os.system(executable_path)
+
+    return True
 
 
 # fmt: off
 
+COMMANDS = [
+    ("all",                        "Update, build and launch the project (default)"),
+    ("init",                       "Initialize project (config, cmake, vscode)"),
+    ("generate_cmake",             "Generate a starting CMakeLists.txt from template"),
+    ("build",                      "Attempt to build the project only"),
+    ("launch [args...]",           "Run the executable in the build folder with optional arguments"),
+    ("clean",                      "Clean build folder"),
+    ("update",                     "Restore CMakeLists.txt to defaults then patch it"),
+    ("restore",                    "Restore CMakeLists.txt to defaults"),
+    ("enable_vscode_intellisense", "Generate .vscode/c_cpp_properties.json for IntelliSense"),
+]
+
+
 def print_usage():
-    print("Usage: cmakebuild [command]")
-    print("Commands:")
-    print("  all                          - Update, build and flash project (default)")
-    print("  init                         - Initialize project (config, cmake, vscode)")
-    print("  generate_cmake               - Generate a starting CMakeLists.txt file from template")
-    print("  build                        - Attempt to build project only")
-    print("  launch [args...]             - Run the executable located in the build folder with optional arguments")
-    print("  clean                        - Clean build folder")
-    print("  update                       - Restore CMakeLists.txt to defaults then patch it")
-    print("  restore                      - Restore CMakeLists.txt to defaults")
-    print("  enable_vscode_intellisense   - Generate .vscode/c_cpp_properties.json for Intellisense")
+    print(f"{term.paint('Usage:', 'bold')} cmakebuild [command]")
+    print()
+    print(term.paint("Commands:", "bold"))
+    width = max(len(name) for name, _ in COMMANDS)
+    for name, description in COMMANDS:
+        print(f"  {term.paint(name.ljust(width), 'cyan')}  {description}")
+    print()
+    print(term.paint("Colors follow NO_COLOR / CMAKEBUILD_COLOR=always|never|auto.", "dim"))
 
 # fmt: on
+
+
+def finish(start_time: float, success: bool, message: str = "") -> None:
+    """Prints the closing banner and exits with the matching status code."""
+    elapsed = f"{time.time() - start_time:.2f}s"
+    if success:
+        term.banner_success(message or f"Done in {elapsed}")
+    else:
+        term.banner_failure(message or f"Failed after {elapsed}")
+    sys.exit(0 if success else 1)
 
 
 if __name__ == "__main__":
@@ -688,70 +748,70 @@ if __name__ == "__main__":
     # detect linux os
     detected_os = platform.system()
     if not detected_os == "Linux":
-        print("This script is intended to run on Linux systems.")
-        print("Detected OS:", detected_os)
+        term.fail("This script is intended to run on Linux systems.")
+        term.detail(f"Detected OS: {detected_os}")
         sys.exit(1)
 
     # Get command line argument
     command = sys.argv[1] if len(sys.argv) > 1 else "help"
 
     if command == "all":
-        update_cmakefile()
+        if not update_cmakefile():
+            finish(start_time, False, "Update failed, not building.")
         if build_project():
-            print("Build succeeded.\nStarting Executible.")
+            term.ok("Build succeeded, starting executable.")
             launch_project()
-            sys.exit(0)
+            finish(start_time, True)
         else:
-            print("Build failed, not flashing.")
             delete_folder("build")
-            sys.exit(1)
+            finish(start_time, False, "Build failed, not launching.")
+
     elif command == "init":
+        term.header("Initializing project")
         if os.path.exists(Config_File):
-            print(f"{Config_File} already exists.")
+            term.skipped(f"{Config_File} already exists.")
         else:
             generate_config_file()
 
         if not os.path.exists(CMakeFile):
             generate_cmake_file()
+        else:
+            term.skipped(f"{CMakeFile} already exists.")
 
         update_vscode_intellisense(create_file=False)
+        finish(start_time, True)
 
     elif command == "generate_cmake":
         force = "--force" in sys.argv
-        if not generate_cmake_file(force):
-            sys.exit(1)
+        finish(start_time, generate_cmake_file(force))
 
     elif command == "build":
-        if build_project():
-            print("Build succeeded.")
-            sys.exit(0)
-        else:
-            print("Build failed!!")
-            sys.exit(1)
+        finish(start_time, build_project())
 
     elif command == "launch":
-        launch_project(sys.argv[2:] if len(sys.argv) > 2 else None)
+        launched = launch_project(sys.argv[2:] if len(sys.argv) > 2 else None)
+        finish(start_time, launched)
 
     elif command == "clean":
         clean_project()
+        finish(start_time, True)
 
     elif command == "update":
-        update_cmakefile()
+        finish(start_time, update_cmakefile())
 
     elif command == "restore":
-        un_patch_cmakefile()
+        finish(start_time, un_patch_cmakefile())
 
     elif command == "enable_vscode_intellisense":
         update_vscode_intellisense(True)
+        finish(start_time, True)
 
-    elif command == "help" or command == "--help" or command == "-h":
+    elif command in ("help", "--help", "-h"):
         print_usage()
         sys.exit(0)
 
     else:
-        print(f"Unknown command: {command}")
+        term.fail(f"Unknown command: {command}")
+        print()
         print_usage()
         sys.exit(1)
-
-    end_time = time.time()
-    print(f"Operation completed in {end_time - start_time:.2f} seconds.")
