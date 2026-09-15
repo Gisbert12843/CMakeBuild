@@ -39,6 +39,7 @@ try:
     _patcher = _load_patcher_module(cmakelist_patcher_script)
     term = _patcher.term
     parse_library_entry = _patcher.parse_library_entry
+    _COMMIT_SHA = _patcher._COMMIT_SHA
 except Exception as exc:  # pragma: no cover - broken install
     print(f"Error: cannot load {cmakelist_patcher_script}: {exc}", file=sys.stderr)
     print("Please reinstall cmakebuild!", file=sys.stderr)
@@ -680,7 +681,211 @@ def update_vscode_include_paths():
         term.fail(f"Error updating c_cpp_properties.json: {e}")
 
 
+def _run_git(args: list, what: str) -> bool:
+    """Runs one git command in the project root, reporting its output on failure."""
+    try:
+        result = subprocess.run(
+            ["git"] + args,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        term.fail(f"Cannot {what}: git is not installed.")
+        return False
+
+    if result.returncode != 0:
+        term.fail(f"Failed to {what} (git exited {result.returncode}).")
+        for line in (result.stderr or result.stdout or "").strip().splitlines():
+            term.detail(line)
+        return False
+    return True
+
+
+def ensure_submodules() -> bool:
+    """Registers and checks out the submodule libraries declared in build.conf.
+
+    A 'submodule=' library names a repository that has to live in the source
+    tree, so the generated CMakeLists.txt needs no network. Someone still has
+    to put it there, and doing it here means a clone of this project is set up
+    by running cmakebuild, with no separate git incantation to remember.
+
+    Registration (git submodule add, which writes .gitmodules) only ever
+    happens for a library that build.conf declares and the repository does not
+    know about yet. An already registered submodule is merely checked out.
+    """
+    if not os.path.exists(Config_File):
+        return True
+
+    try:
+        with open(Config_File, "r") as f:
+            config = parse_config_topics(f.read())
+    except Exception as e:
+        term.fail(f"Error parsing {Config_File}: {e}")
+        return False
+
+    submodules = []
+    for entry in config.get("Libraries", []):
+        if entry.startswith("#"):
+            continue
+        try:
+            spec = parse_library_entry(entry)
+        except ValueError:
+            continue  # The patcher reports malformed entries.
+        if spec.is_submodule:
+            submodules.append(spec)
+
+    if not submodules:
+        return True
+
+    term.header("Submodules")
+
+    # Outside a git work tree there is nothing to register into - a release
+    # tarball or an unpacked source archive is expected to ship the sources.
+    if not os.path.isdir(".git"):
+        missing = [
+            s for s in submodules
+            if not os.path.exists(os.path.join(s.cmake_path, "CMakeLists.txt"))
+        ]
+        if missing:
+            term.warn("Not a git repository, cannot check out:")
+            for spec in missing:
+                term.detail(f"{spec.name} -> {spec.submodule}")
+        else:
+            term.skipped("Not a git repository, submodules assumed to be in place.")
+        return not missing
+
+    ok = True
+    for spec in submodules:
+        registered_url = _gitmodules_get(spec.submodule, "url")
+        registered_ref = _gitmodules_get(spec.submodule, "branch")
+        present = os.path.exists(os.path.join(spec.cmake_path, "CMakeLists.txt"))
+
+        if registered_url is None:
+            pinned = f" @ {spec.ref}" if spec.ref else ""
+            term.step(f"Registering {spec.name}{pinned} as {spec.submodule}...")
+            args = ["submodule", "add"]
+            if spec.ref and not _COMMIT_SHA.match(spec.ref):
+                args += ["-b", spec.ref]
+            args += [spec.url, spec.submodule]
+            if not _run_git(args, f"register submodule '{spec.submodule}'"):
+                ok = False
+                continue
+            if not _checkout_submodule(spec, move=bool(spec.ref)):
+                ok = False
+                continue
+            term.ok(f"{spec.name} ready at {spec.cmake_path}")
+            continue
+
+        # build.conf is the source of truth, so a URL or ref edited there has to
+        # reach an already registered submodule - otherwise changing the branch
+        # silently keeps building the old one.
+        drift = []
+        if registered_url != spec.url:
+            drift.append(f"url {registered_url} -> {spec.url}")
+        # A commit pin is not a branch and is never recorded in .gitmodules, so
+        # only a named ref is compared against what is registered there.
+        wants_branch = spec.ref if spec.ref and not _COMMIT_SHA.match(spec.ref) else None
+        if wants_branch != registered_ref:
+            drift.append(f"branch {registered_ref or '(default)'} -> {wants_branch or '(default)'}")
+
+        if not drift and present:
+            term.skipped(f"{spec.name} already checked out at {spec.submodule}")
+            continue
+
+        if drift:
+            term.step(f"Updating {spec.name} submodule: {', '.join(drift)}")
+            if registered_url != spec.url:
+                if not _run_git(
+                    ["submodule", "set-url", "--", spec.submodule, spec.url],
+                    f"set url of submodule '{spec.submodule}'",
+                ):
+                    ok = False
+                    continue
+            if wants_branch != registered_ref:
+                args = ["submodule", "set-branch"]
+                args += ["--branch", wants_branch] if wants_branch else ["--default"]
+                args += ["--", spec.submodule]
+                if not _run_git(args, f"set branch of submodule '{spec.submodule}'"):
+                    ok = False
+                    continue
+            # Push the rewritten .gitmodules into .git/config, which is what the
+            # following update actually reads.
+            if not _run_git(
+                ["submodule", "sync", "--recursive", "--", spec.submodule],
+                f"sync submodule '{spec.submodule}'",
+            ):
+                ok = False
+                continue
+        else:
+            term.step(f"Checking out {spec.submodule}...")
+
+        if not _checkout_submodule(spec, move=bool(drift)):
+            ok = False
+            continue
+
+        if drift:
+            term.info(
+                f"'{spec.submodule}' now points at a different commit - "
+                "commit the updated gitlink and .gitmodules."
+            )
+        term.ok(f"{spec.name} ready at {spec.cmake_path}")
+
+    return ok
+
+
+def _gitmodules_get(path: str, key: str) -> str:
+    """Reads submodule.<path>.<key> from .gitmodules, or None if it is not set.
+
+    The submodule name defaults to its path, which is what 'git submodule add'
+    uses unless it is given an explicit --name.
+    """
+    if not os.path.exists(".gitmodules"):
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "config", "-f", ".gitmodules", "--get", f"submodule.{path}.{key}"],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _checkout_submodule(spec, move: bool) -> bool:
+    """Brings the submodule working tree to the ref build.conf asks for.
+
+    move says the recorded ref changed, so the checkout has to follow it rather
+    than the commit the gitlink still pins. A branch or tag is fetched with
+    --remote; a raw commit cannot be, since --remote only ever resolves a
+    branch, so that one is fetched and checked out directly.
+    """
+    if move and spec.ref and _COMMIT_SHA.match(spec.ref):
+        if not _run_git(
+            ["submodule", "update", "--init", "--recursive", "--", spec.submodule],
+            f"check out submodule '{spec.submodule}'",
+        ):
+            return False
+        return _run_git(
+            ["-C", spec.submodule, "fetch", "origin", spec.ref],
+            f"fetch commit {spec.ref} in '{spec.submodule}'",
+        ) and _run_git(
+            ["-C", spec.submodule, "checkout", "--detach", spec.ref],
+            f"check out commit {spec.ref} in '{spec.submodule}'",
+        )
+
+    args = ["submodule", "update", "--init", "--recursive"]
+    if move:
+        # Without --remote this re-checks-out the old pinned commit, which is
+        # exactly the bug: the branch in build.conf would be ignored.
+        args.append("--remote")
+    args += ["--", spec.submodule]
+    return _run_git(args, f"check out submodule '{spec.submodule}'")
+
+
 def update_cmakefile() -> bool:
+    if not ensure_submodules():
+        return False
     un_patch_cmakefile()
     return patch_project()
 

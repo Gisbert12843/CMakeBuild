@@ -184,12 +184,29 @@ class Task:
 #     LibName path/to/library                -> a folder inside the project
 #     LibName <git-url> [ref] [key=value...] -> cloned by the generated CMakeLists
 # A bare token after the URL is the ref (branch, tag or commit); the supported
-# key=value options are ref= and subdir=, the latter naming the folder inside
-# the repository that holds the CMakeLists.txt to add.
+# key=value options are ref=, subdir= and submodule=. subdir= names the folder
+# inside the repository that holds the CMakeLists.txt to add.
 # Remote libraries are checked out inside the build directory so they never
 # show up in the source tree. The folder is named after the library instead of
 # using FetchContent's lowercased "<name>-src" default, which keeps the path
 # predictable for the include paths written into c_cpp_properties.json.
+#
+# submodule=<path> declares that the repository is vendored into the source
+# tree as a git submodule at <path>, instead of being cloned at configure time.
+# The URL and ref stay in the declaration as metadata (they are what the
+# submodule is registered with), but the generated CMakeLists.txt only does a
+# plain add_subdirectory against the checkout. That keeps the generated file
+# self-contained and network-free, which is what build systems that forbid
+# configure-time downloads need: Yocto's cmake.bbclass passes
+# -DFETCHCONTENT_FULLY_DISCONNECTED=ON to every recipe, because all sources
+# have to arrive through SRC_URI. Under that flag a FetchContent library
+# resolves to an empty directory and is skipped without an error, leaving the
+# library name to decay into a bare -l<name> link flag - so the build only
+# fails much later, on a missing header. Submodule libraries are immune, and
+# the existence guard emitted next to them turns a forgotten checkout into an
+# immediate, actionable configure error.
+# cmakebuild never runs git itself; it prints the command to register a
+# submodule that is declared but not yet checked out.
 Build_Dir = "build"
 Remote_Library_Subdir = "_remote"
 Remote_Library_Dir = f"{Build_Dir}/{Remote_Library_Subdir}"
@@ -208,10 +225,22 @@ class LibrarySpec:
     url: str | None = None  # Only set for remote libraries.
     ref: str | None = None  # Branch, tag or commit; remote libraries only.
     subdir: str | None = None  # Folder inside the repo holding its CMakeLists.
+    submodule: str | None = None  # In-tree checkout path; suppresses FetchContent.
 
     @property
     def is_remote(self) -> bool:
+        """The declaration carries a git URL, however the sources are obtained."""
         return self.url is not None
+
+    @property
+    def is_submodule(self) -> bool:
+        """Vendored into the source tree, so nothing is fetched at configure time."""
+        return self.submodule is not None
+
+    @property
+    def is_fetched(self) -> bool:
+        """Cloned by the generated CMakeLists.txt via FetchContent."""
+        return self.is_remote and not self.is_submodule
 
     @property
     def cmake_path(self) -> str:
@@ -229,7 +258,8 @@ def is_remote_library_url(candidate: str) -> bool:
 
 
 _REMOTE_FORMAT_HINT = (
-    "'library_name <git-url> [branch|tag|commit] [ref=...] [subdir=...]'"
+    "'library_name <git-url> [branch|tag|commit] [ref=...] [subdir=...] "
+    "[submodule=...]'"
 )
 
 
@@ -256,6 +286,7 @@ def parse_library_entry(entry: str) -> LibrarySpec:
     url, options = tokens[0], tokens[1:]
     ref = None
     subdir = None
+    submodule = None
 
     for option in options:
         key, sep, value = option.partition("=")
@@ -275,6 +306,18 @@ def parse_library_entry(entry: str) -> LibrarySpec:
             if subdir is not None:
                 raise ValueError(f"Library '{name}' sets the subdir more than once.")
             subdir = value.strip("/")
+        elif key == "submodule":
+            if submodule is not None:
+                raise ValueError(f"Library '{name}' sets the submodule more than once.")
+            # Checked before stripping, so that a leading "/" is still visible.
+            if os.path.isabs(value) or value.startswith(".."):
+                # The path is committed to .gitmodules and has to mean the same
+                # thing in every clone, so it stays inside the project.
+                raise ValueError(
+                    f"Submodule path '{value}' of library '{name}' must be "
+                    "relative to the project root."
+                )
+            submodule = value.strip("/")
         else:
             raise ValueError(
                 f"Unknown option '{key}' for library '{name}'. "
@@ -283,10 +326,13 @@ def parse_library_entry(entry: str) -> LibrarySpec:
 
     return LibrarySpec(
         name=name,
-        path=f"{Remote_Library_Dir}/{name}",
+        # A submodule already sits in the source tree; only a fetched library
+        # needs the checkout directory under the build folder.
+        path=submodule if submodule else f"{Remote_Library_Dir}/{name}",
         url=url,
         ref=ref,
         subdir=subdir,
+        submodule=submodule,
     )
 ###
 
@@ -858,6 +904,78 @@ class CMakePatcher:
         )
         return block
 
+    @staticmethod
+    def _subdirectory_block(library: LibrarySpec) -> list[str]:
+        """add_subdirectory for a library that is already in the source tree.
+
+        The existence check in front of it is what makes a missing checkout
+        fail usefully. add_subdirectory on an absent folder is a hard error,
+        but the failure this guards against is the quiet one: if the folder
+        exists yet holds no CMakeLists.txt - an uninitialised submodule, or a
+        FetchContent source dir emptied by -DFETCHCONTENT_FULLY_DISCONNECTED=ON
+        - then no target by this name is ever defined, and the name in
+        target_link_libraries silently decays into a bare -l<name> link flag.
+        Configure reports success and the build dies later on a missing header.
+        """
+        location = library.cmake_path
+        # An absolute path is already anchored; a relative one is read from the
+        # project root, the same base add_subdirectory() itself resolves against.
+        guard_path = (
+            location
+            if os.path.isabs(location)
+            else f"${{CMAKE_CURRENT_SOURCE_DIR}}/{location}"
+        )
+        hint = (
+            "Run: git submodule update --init --recursive"
+            if library.is_submodule
+            else f"Expected a CMakeLists.txt in '{location}'."
+        )
+        block = []
+        if library.is_submodule:
+            block = CMakePatcher._submodule_checkout_block(library, guard_path)
+        return block + [
+            "",
+            f"if(NOT EXISTS {guard_path}/CMakeLists.txt)",
+            f"    message(FATAL_ERROR",
+            f'        "Library \'{library.name}\' is missing at \'{location}\'. {hint}")',
+            "endif()",
+            f"add_subdirectory({location} ${{CMAKE_BINARY_DIR}}/{os.path.basename(library.path)})",
+        ]
+
+    @staticmethod
+    def _submodule_checkout_block(library: LibrarySpec, guard_path: str) -> list[str]:
+        """Checks out a registered submodule that nobody initialised yet.
+
+        This is the 'git clone' without --recurse-submodules case, which is
+        otherwise a dead end for anyone who just cloned the project. It only
+        runs when the checkout is actually missing and the project really is a
+        git work tree, so it stays inert where it must: a release tarball has
+        no .git, and a Yocto build gets its sources through SRC_URI with the
+        submodule already populated, so the guard is false and git is never
+        called. Registration is not done here - CMake would have to write
+        .gitmodules and stage it - that is cmakebuild's job.
+        """
+        # CMake variables are global, so they are namespaced per library.
+        slug = re.sub(r"[^A-Za-z0-9_]", "_", library.name)
+        return [
+            "",
+            f"if(NOT EXISTS {guard_path}/CMakeLists.txt)",
+            "    find_package(Git QUIET)",
+            f"    if(GIT_FOUND AND EXISTS ${{CMAKE_CURRENT_SOURCE_DIR}}/.git)",
+            f'        message(STATUS "Checking out submodule \'{library.submodule}\' for {library.name}")',
+            "        execute_process(",
+            f"            COMMAND ${{GIT_EXECUTABLE}} submodule update --init --recursive -- {library.submodule}",
+            "            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}",
+            f"            RESULT_VARIABLE {slug}_SUBMODULE_RESULT)",
+            f"        if(NOT {slug}_SUBMODULE_RESULT EQUAL 0)",
+            "            message(FATAL_ERROR",
+            f'                "git submodule update --init failed for \'{library.submodule}\' '
+            f'(exit ${{{slug}_SUBMODULE_RESULT}}).")',
+            "        endif()",
+            "    endif()",
+            "endif()",
+        ]
+
     def _handle_libraries(self, children: list[str]) -> bool:
 
         if not children:
@@ -878,8 +996,8 @@ class CMakePatcher:
             )
         )
 
-        remote_libraries = [library for library in libraries if library.is_remote]
-        if remote_libraries:
+        fetched_libraries = [library for library in libraries if library.is_fetched]
+        if fetched_libraries:
             self.tasks.append(
                 Task(
                     TaskType.INSERT_BELOW,
@@ -888,9 +1006,11 @@ class CMakePatcher:
                 )
             )
 
-        # Local libraries become a plain add_subdirectory, e.g.
-        # add_subdirectory(../software/SDK/Cpp ${CMAKE_BINARY_DIR}/software_sdk_cpp),
-        # remote ones a FetchContent block that does the same after cloning.
+        # Libraries that are already on disk - local folders and submodule
+        # checkouts alike - become a guarded add_subdirectory, e.g.
+        # add_subdirectory(../software/SDK/Cpp ${CMAKE_BINARY_DIR}/software_sdk_cpp).
+        # Only a fetched library gets a FetchContent block, which does the same
+        # after cloning.
         for library in libraries:
             self.tasks.append(
                 Task(
@@ -898,31 +1018,64 @@ class CMakePatcher:
                     "# SUBDIRECTORY_MARKER",
                     (
                         self._fetch_content_block(library)
-                        if library.is_remote
-                        else [
-                            f"add_subdirectory({library.path} ${{CMAKE_BINARY_DIR}}/{os.path.basename(library.path)})"
-                        ]
+                        if library.is_fetched
+                        else self._subdirectory_block(library)
                     ),
                 )
             )
 
         term.task(f"Link libraries: {', '.join(lib.name for lib in libraries)}")
 
-        local_paths = [lib.path for lib in libraries if not lib.is_remote]
-        if local_paths:
-            term.task(f"Add subdirectories: {', '.join(local_paths)}")
+        in_tree_paths = [lib.cmake_path for lib in libraries if not lib.is_fetched]
+        if in_tree_paths:
+            term.task(f"Add subdirectories: {', '.join(in_tree_paths)}")
 
-        for library in remote_libraries:
+        for library in fetched_libraries:
             pinned = f" @ {library.ref}" if library.ref else " (default branch)"
             term.task(f"Fetch {library.url}{pinned} into {library.cmake_path}")
 
-        if remote_libraries:
+        if fetched_libraries:
             term.info(
                 f"Remote libraries are cloned into '{Remote_Library_Dir}/', so a "
                 "clean build re-fetches them."
             )
 
+        self._report_submodules([lib for lib in libraries if lib.is_submodule])
+
         return True
+
+    @staticmethod
+    def _report_submodules(submodules: list[LibrarySpec]) -> None:
+        """Names the submodules and, for any that is missing, how to check it out.
+
+        Registering it is left to the user on purpose: cmakebuild generates
+        files and never touches the repository or the network.
+        """
+        for library in submodules:
+            pinned = f" @ {library.ref}" if library.ref else " (default branch)"
+            term.task(
+                f"Use submodule '{library.submodule}'{pinned} for {library.name} "
+                "(no configure-time download)"
+            )
+
+        missing = [
+            library
+            for library in submodules
+            if not os.path.exists(os.path.join(library.cmake_path, "CMakeLists.txt"))
+        ]
+        if not missing:
+            return
+
+        term.info(
+            "Declared as a submodule but not checked out yet - configuring will "
+            "fail until it is. Register it with:"
+        )
+        for library in missing:
+            branch = f"-b {library.ref} " if library.ref else ""
+            term.info(
+                f"    git submodule add {branch}{library.url} {library.submodule}"
+            )
+        term.info("    git submodule update --init --recursive")
 
     def _handle_languages(self, children: list[str]) -> bool:
         if not children:

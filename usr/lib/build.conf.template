@@ -31,6 +31,13 @@ Libraries
     # libName https://github.com/owner/repo.git BRANCH
     # libName git@github.com:owner/repo.git BRANCH subdir=SDK
 
+    ## submodule=<path> vendors the repo into the tree instead of cloning at
+    ## configure time, so the generated CMakeLists.txt needs no network. Required
+    ## for build systems that forbid configure-time downloads, e.g. Yocto, which
+    ## passes -DFETCHCONTENT_FULLY_DISCONNECTED=ON to every cmake recipe.
+    ## cmakebuild does not run git; it prints the "git submodule add" to run.
+    # libName git@github.com:owner/repo.git BRANCH subdir=SDK submodule=lib/libName
+
 Languages
     C
     CXX
