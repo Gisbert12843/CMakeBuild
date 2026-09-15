@@ -17,8 +17,8 @@ python_executable = "python3"
 cmakelist_patcher_script = os.path.join(lib_dir, "__cmakelist_patcher")
 
 
-def _load_terminal_styling(path: str):
-    """Borrows the terminal styling helpers from the patcher script.
+def _load_patcher_module(path: str):
+    """Loads the patcher script so its helpers can be reused here.
 
     The patcher has no .py extension, so it is loaded by path rather than
     imported by name.
@@ -32,11 +32,13 @@ def _load_terminal_styling(path: str):
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
-    return module.term
+    return module
 
 
 try:
-    term = _load_terminal_styling(cmakelist_patcher_script)
+    _patcher = _load_patcher_module(cmakelist_patcher_script)
+    term = _patcher.term
+    parse_library_entry = _patcher.parse_library_entry
 except Exception as exc:  # pragma: no cover - broken install
     print(f"Error: cannot load {cmakelist_patcher_script}: {exc}", file=sys.stderr)
     print("Please reinstall cmakebuild!", file=sys.stderr)
@@ -615,27 +617,30 @@ def update_vscode_include_paths():
             continue
         vscode_include_paths.append(f"${{workspaceFolder}}/{folder}")
 
-    # Add library paths (Libraries format: "libName path/to/lib")
+    # Add library paths. Remote libraries resolve to the folder the generated
+    # CMakeLists clones them into, so they are indexed like local ones.
     libraries = config.get("Libraries", [])
     for lib_entry in libraries:
         if lib_entry.startswith("#"):
             continue
-        parts = lib_entry.split(" ", 1)
-        if len(parts) == 2:
-            lib_path = parts[1]
-            # Add the library path itself
+        try:
+            lib_path = parse_library_entry(lib_entry).cmake_path
+        except ValueError as e:
+            term.warn(str(e))
+            continue
+        # Add the library path itself
+        if lib_path.startswith("/"):
+            # Absolute path
+            vscode_include_paths.append(lib_path)
+        else:
+            # Relative path
+            vscode_include_paths.append(f"${{workspaceFolder}}/{lib_path}")
+        # Also add common include subdirectories if they might exist
+        for subdir in ["include", "inc", "src", "Include", "Inc", "Src"]:
             if lib_path.startswith("/"):
-                # Absolute path
-                vscode_include_paths.append(lib_path)
+                vscode_include_paths.append(f"{lib_path}/{subdir}")
             else:
-                # Relative path
-                vscode_include_paths.append(f"${{workspaceFolder}}/{lib_path}")
-            # Also add common include subdirectories if they might exist
-            for subdir in ["include", "inc", "src", "Include", "Inc", "Src"]:
-                if lib_path.startswith("/"):
-                    vscode_include_paths.append(f"{lib_path}/{subdir}")
-                else:
-                    vscode_include_paths.append(f"${{workspaceFolder}}/{lib_path}/{subdir}")
+                vscode_include_paths.append(f"${{workspaceFolder}}/{lib_path}/{subdir}")
 
     if len(vscode_include_paths) <= 1:
         term.skipped("No include paths configured in build.conf.")

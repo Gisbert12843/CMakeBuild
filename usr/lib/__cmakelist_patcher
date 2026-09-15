@@ -2,6 +2,7 @@
 from datetime import datetime
 import os
 import collections
+import re
 import sys
 import argparse
 from dataclasses import dataclass, field
@@ -176,6 +177,118 @@ class Task:
     new_line_content: list[str]  # Can be one or more lines
     padding: int = field(default=0)  # Number of empty lines for padding tasks
     completed: bool = field(default=False, init=False)
+
+
+### Library declarations
+# A library is declared as either
+#     LibName path/to/library                -> a folder inside the project
+#     LibName <git-url> [ref] [key=value...] -> cloned by the generated CMakeLists
+# A bare token after the URL is the ref (branch, tag or commit); the supported
+# key=value options are ref= and subdir=, the latter naming the folder inside
+# the repository that holds the CMakeLists.txt to add.
+# Remote libraries are checked out inside the build directory so they never
+# show up in the source tree. The folder is named after the library instead of
+# using FetchContent's lowercased "<name>-src" default, which keeps the path
+# predictable for the include paths written into c_cpp_properties.json.
+Build_Dir = "build"
+Remote_Library_Subdir = "_remote"
+Remote_Library_Dir = f"{Build_Dir}/{Remote_Library_Subdir}"
+
+# git@host:owner/repo.git - the scp-like syntax git accepts without a scheme.
+_SCP_LIKE_URL = re.compile(r"^[\w.+-]+@[\w.-]+:")
+_COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{7,40}$")
+
+
+@dataclass
+class LibrarySpec:
+    """A single entry of the 'Libraries' topic."""
+
+    name: str
+    path: str  # Where the sources live, relative to the project root.
+    url: str | None = None  # Only set for remote libraries.
+    ref: str | None = None  # Branch, tag or commit; remote libraries only.
+    subdir: str | None = None  # Folder inside the repo holding its CMakeLists.
+
+    @property
+    def is_remote(self) -> bool:
+        return self.url is not None
+
+    @property
+    def cmake_path(self) -> str:
+        """The folder whose CMakeLists.txt gets added to the build."""
+        return f"{self.path}/{self.subdir}" if self.subdir else self.path
+
+
+def is_remote_library_url(candidate: str) -> bool:
+    """True when the value looks like a git URL rather than a local path."""
+    return (
+        candidate.startswith(("http://", "https://", "ssh://", "git://", "git+ssh://"))
+        or candidate.endswith(".git")
+        or bool(_SCP_LIKE_URL.match(candidate))
+    )
+
+
+_REMOTE_FORMAT_HINT = (
+    "'library_name <git-url> [branch|tag|commit] [ref=...] [subdir=...]'"
+)
+
+
+def parse_library_entry(entry: str) -> LibrarySpec:
+    """Turns one 'Libraries' line into a LibrarySpec.
+
+    Raises:
+        ValueError: If the line is not a well-formed library declaration.
+    """
+    name, _, remainder = entry.partition(" ")
+    remainder = remainder.strip()
+
+    if not name or not remainder:
+        raise ValueError(
+            f"Library definition '{entry}' must be in format "
+            f"'library_name path/to/library' or {_REMOTE_FORMAT_HINT}"
+        )
+
+    # Local paths may contain spaces, so only a git URL is split any further.
+    tokens = remainder.split()
+    if not is_remote_library_url(tokens[0]):
+        return LibrarySpec(name=name, path=remainder)
+
+    url, options = tokens[0], tokens[1:]
+    ref = None
+    subdir = None
+
+    for option in options:
+        key, sep, value = option.partition("=")
+        if not sep:
+            # A bare token is the ref, the shorthand for the common case.
+            key, value = "ref", option
+        elif not value:
+            raise ValueError(
+                f"Option '{option}' of library '{name}' is missing a value."
+            )
+
+        if key == "ref":
+            if ref is not None:
+                raise ValueError(f"Library '{name}' sets the ref more than once.")
+            ref = value
+        elif key == "subdir":
+            if subdir is not None:
+                raise ValueError(f"Library '{name}' sets the subdir more than once.")
+            subdir = value.strip("/")
+        else:
+            raise ValueError(
+                f"Unknown option '{key}' for library '{name}'. "
+                f"Expected {_REMOTE_FORMAT_HINT}"
+            )
+
+    return LibrarySpec(
+        name=name,
+        path=f"{Remote_Library_Dir}/{name}",
+        url=url,
+        ref=ref,
+        subdir=subdir,
+    )
+###
 
 
 def parse_config_topics(file_content: str) -> dict[str, list[str]]:
@@ -713,28 +826,49 @@ class CMakePatcher:
         term.task(f"Add compile options.")
         return True
 
+    @staticmethod
+    def _fetch_content_block(library: LibrarySpec) -> list[str]:
+        """The FetchContent calls that clone a remote library at configure time.
+
+        SOURCE_DIR keeps the checkout inside the build directory, under a folder
+        named after the library, and FetchContent_MakeAvailable adds it as a
+        subdirectory - the same thing a local library gets.
+        """
+        block = [
+            "",
+            f"FetchContent_Declare({library.name}",
+            f"    GIT_REPOSITORY {library.url}",
+        ]
+        if library.ref:
+            block.append(f"    GIT_TAG        {library.ref}")
+        # A shallow clone can only resolve a named ref, never a raw commit hash.
+        if not library.ref or not _COMMIT_SHA.match(library.ref):
+            block.append("    GIT_SHALLOW    TRUE")
+        block.append("    GIT_PROGRESS   TRUE")
+        if library.subdir:
+            # The CMakeLists.txt sits in a subfolder of the repository, so point
+            # MakeAvailable at it instead of the (possibly project-less) root.
+            block.append(f"    SOURCE_SUBDIR  {library.subdir}")
+        block.extend(
+            [
+                f"    SOURCE_DIR     ${{CMAKE_BINARY_DIR}}/{Remote_Library_Subdir}/{library.name}",
+                ")",
+                f"FetchContent_MakeAvailable({library.name})",
+            ]
+        )
+        return block
+
     def _handle_libraries(self, children: list[str]) -> bool:
 
         if not children:
             term.skipped("Ignoring empty 'Libraries' topic.")
             return False
-        library_names = []
-        library_paths = []
 
-        for child in children:
-            parts = child.split(" ", 1)
-            if len(parts) == 2:
-                library_name, library_path = parts
-                library_names.append(library_name)
-                library_paths.append(library_path)
-            else:
-                raise ValueError(
-                    f"Library definition '{child}' must be in format 'library_name path/to/library'"
-                )
+        libraries = [parse_library_entry(child) for child in children]
 
         # Create complete target_link_libraries call
         content = ["target_link_libraries(${CMAKE_PROJECT_NAME}"]
-        content.extend([f"    {name}" for name in library_names])
+        content.extend([f"    {library.name}" for library in libraries])
 
         self.tasks.append(
             Task(
@@ -743,21 +877,51 @@ class CMakePatcher:
                 content,
             )
         )
-        # e.g. add_subdirectory(../software/SDK/Cpp ${CMAKE_BINARY_DIR}/software_sdk_cpp)
-        # Create tasks for adding subdirectories
-        for library_path in library_paths:
+
+        remote_libraries = [library for library in libraries if library.is_remote]
+        if remote_libraries:
             self.tasks.append(
                 Task(
                     TaskType.INSERT_BELOW,
                     "# SUBDIRECTORY_MARKER",
-                    [
-                        f"add_subdirectory({library_path} ${{CMAKE_BINARY_DIR}}/{os.path.basename(library_path)})"
-                    ],
+                    ["include(FetchContent)"],
                 )
             )
 
-        term.task(f"Link libraries: {', '.join(library_names)}")
-        term.task(f"Add subdirectories: {', '.join(library_paths)}")
+        # Local libraries become a plain add_subdirectory, e.g.
+        # add_subdirectory(../software/SDK/Cpp ${CMAKE_BINARY_DIR}/software_sdk_cpp),
+        # remote ones a FetchContent block that does the same after cloning.
+        for library in libraries:
+            self.tasks.append(
+                Task(
+                    TaskType.INSERT_BELOW,
+                    "# SUBDIRECTORY_MARKER",
+                    (
+                        self._fetch_content_block(library)
+                        if library.is_remote
+                        else [
+                            f"add_subdirectory({library.path} ${{CMAKE_BINARY_DIR}}/{os.path.basename(library.path)})"
+                        ]
+                    ),
+                )
+            )
+
+        term.task(f"Link libraries: {', '.join(lib.name for lib in libraries)}")
+
+        local_paths = [lib.path for lib in libraries if not lib.is_remote]
+        if local_paths:
+            term.task(f"Add subdirectories: {', '.join(local_paths)}")
+
+        for library in remote_libraries:
+            pinned = f" @ {library.ref}" if library.ref else " (default branch)"
+            term.task(f"Fetch {library.url}{pinned} into {library.cmake_path}")
+
+        if remote_libraries:
+            term.info(
+                f"Remote libraries are cloned into '{Remote_Library_Dir}/', so a "
+                "clean build re-fetches them."
+            )
+
         return True
 
     def _handle_languages(self, children: list[str]) -> bool:

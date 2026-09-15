@@ -26,6 +26,11 @@ CompileOptions
 Libraries
     # libName ../lib/path
 
+    ## remote libraries are cloned into build/_remote/<libName> by CMake itself
+    # libName git@github.com:owner/repo.git
+    # libName https://github.com/owner/repo.git BRANCH
+    # libName git@github.com:owner/repo.git BRANCH subdir=SDK
+
 Languages
     C
     CXX
