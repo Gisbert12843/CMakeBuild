@@ -3,6 +3,7 @@ Project
 
 Toolchain
     # gcc-arm-none-eabi
+    # gcc
 
 ToolchainPath
     # /usr/bin
@@ -12,10 +13,10 @@ BuildType
     # Release
 
 IncludeFolders
-    # Inc
+    # inc
 
 SourceFolders
-    # Src
+    # src
 
 CompileOptions
     # -Wall
@@ -44,6 +45,7 @@ GlobalDefines
     # TESTMAKRO=2
 
 CustomSets
+    ## for RPI ARM
     # CMAKE_SYSTEM_NAME Generic
     # CMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY
     # CMAKE_EXE_LINKER_FLAGS_INIT "--specs=nosys.specs"
